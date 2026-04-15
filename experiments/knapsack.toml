@@ -1,0 +1,56 @@
+name = "knapsack"
+description = "Deterministic hello-world benchmark for the AlphaEvolve pipeline."
+seed_program = "knapsack_seed.py"
+primary_metric = "score"
+target_score = 275.0
+system_instructions = """
+Act as an expert Python optimization engineer.
+Improve the provided program by proposing small, coherent code changes.
+Use SEARCH/REPLACE diff blocks only and aim to increase the evaluation score.
+"""
+task_description = """
+The benchmark is a simple knapsack heuristic.
+Optimize the ordering heuristic while keeping the Python module executable.
+"""
+evaluation_contract = """
+The program exposes evaluate() and should maximize the returned score.
+The current benchmark reaches the global optimum when score == 275.0.
+"""
+
+[model]
+provider = "fake"
+model = "gemma4:26b"
+base_url = "http://localhost:11434"
+request_timeout_seconds = 60.0
+temperature = 0.2
+max_prompt_tokens = 12000
+reserved_completion_tokens = 2048
+max_history_programs = 4
+
+[sandbox]
+backend = "fake"
+image = "python:3.12-slim"
+runtime = "runsc"
+network_mode = "none"
+read_only_root = true
+tmpfs_path = "/tmp/eval"
+tmpfs_size_bytes = 5242880
+mem_limit = "256m"
+cpu_quota = 50000
+timeout_seconds = 10.0
+working_dir = "/workspace"
+
+[archive]
+code_length_buckets = [0, 512, 1024, 2048, 4096, 8192, 16384]
+eval_time_buckets_ms = [0, 10, 50, 100, 250, 500, 1000, 5000, 10000]
+hall_of_fame_size = 20
+recent_per_cell = 5
+
+[controller]
+llm_concurrency = 2
+evaluation_concurrency = 2
+max_generations = 6
+max_pending_prompts = 4
+max_pending_evaluations = 4
+max_retries = 3
+metrics_interval_seconds = 2.0

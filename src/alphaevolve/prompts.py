@@ -1,0 +1,177 @@
+"""Prompt construction with a bounded history window."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Sequence
+
+from alphaevolve.errors import PromptTooLargeError
+from alphaevolve.models import Program, PromptBudget
+from alphaevolve.token_estimator import CharacterTokenEstimator, TokenEstimator
+
+
+def _head_tail_excerpt(code: str, head_lines: int = 8, tail_lines: int = 8) -> str:
+    lines = code.splitlines()
+    if len(lines) <= head_lines + tail_lines:
+        return code
+    head = "\n".join(lines[:head_lines])
+    tail = "\n".join(lines[-tail_lines:])
+    return f"{head}\n...\n{tail}"
+
+
+@dataclass(frozen=True, slots=True)
+class RenderedPrompt:
+    """A fully rendered prompt plus prompt-budget metadata."""
+
+    text: str
+    estimated_tokens: int
+    included_program_ids: tuple[str, ...]
+    summarized_program_ids: tuple[str, ...]
+
+
+class PromptBuilder:
+    """Construct prompts that stay within a configured prompt budget."""
+
+    def __init__(
+        self,
+        budget: PromptBudget,
+        token_estimator: TokenEstimator | None = None,
+    ) -> None:
+        self._budget = budget
+        self._token_estimator = token_estimator or CharacterTokenEstimator()
+
+    def build(
+        self,
+        *,
+        system_instructions: str,
+        task_contract: str,
+        current_program: Program,
+        history: Sequence[Program],
+    ) -> RenderedPrompt:
+        system_section = self._render_system_section(system_instructions)
+        task_section = self._render_task_section(task_contract)
+        current_section = self._render_current_program(current_program)
+        base_sections = [system_section, task_section, current_section]
+        base_prompt = "\n\n".join(base_sections)
+        base_tokens = self._token_estimator.estimate(base_prompt)
+        if base_tokens > self._budget.usable_prompt_tokens:
+            raise PromptTooLargeError(
+                "Current program is too large for configured model budget."
+            )
+
+        remaining_budget = self._budget.usable_prompt_tokens - base_tokens
+        history_sections: list[str] = []
+        included: list[str] = []
+        summarized: list[str] = []
+
+        ranked_history = self._rank_history(current_program, history)[: self._budget.max_history_programs]
+        if ranked_history and remaining_budget > 0:
+            history_header = "## Prior High-Performing Programs"
+            header_tokens = self._token_estimator.estimate(history_header)
+            if header_tokens <= remaining_budget:
+                history_sections.append(history_header)
+                remaining_budget -= header_tokens
+
+        for program in ranked_history:
+            full_card = self._render_history_program(program)
+            full_tokens = self._token_estimator.estimate(full_card)
+            if full_tokens <= remaining_budget:
+                history_sections.append(full_card)
+                included.append(program.id)
+                remaining_budget -= full_tokens
+                continue
+
+            summary_card = self._render_summary_program(program)
+            summary_tokens = self._token_estimator.estimate(summary_card)
+            if summary_tokens <= remaining_budget:
+                history_sections.append(summary_card)
+                included.append(program.id)
+                summarized.append(program.id)
+            break
+
+        prompt = "\n\n".join(base_sections + history_sections)
+        estimated_tokens = self._token_estimator.estimate(prompt)
+        if estimated_tokens > self._budget.usable_prompt_tokens:
+            raise PromptTooLargeError("Prompt exceeded usable token budget after rendering.")
+        return RenderedPrompt(
+            text=prompt,
+            estimated_tokens=estimated_tokens,
+            included_program_ids=tuple(included),
+            summarized_program_ids=tuple(summarized),
+        )
+
+    def _render_system_section(self, system_instructions: str) -> str:
+        return (
+            "## System Instructions\n"
+            f"{system_instructions.strip()}\n\n"
+            "Respond with SEARCH/REPLACE diff blocks only.\n"
+            "Use this exact structure for every change:\n"
+            "<<<<<<< SEARCH\n"
+            "<old code>\n"
+            "=======\n"
+            "<new code>\n"
+            ">>>>>>> REPLACE\n"
+            "Make changes that are internally consistent across the full program."
+        )
+
+    def _render_task_section(self, task_contract: str) -> str:
+        return f"## Task and Evaluation Contract\n{task_contract.strip()}"
+
+    def _render_current_program(self, program: Program) -> str:
+        metrics = ", ".join(
+            f"{name}={value:.3f}" for name, value in sorted(program.metrics.items())
+        ) or "unscored"
+        return (
+            "## Current Program\n"
+            f"Program ID: {program.id}\n"
+            f"Parent ID: {program.parent_id or 'none'}\n"
+            f"Latest metrics: {metrics}\n\n"
+            "```python\n"
+            f"{program.code.rstrip()}\n"
+            "```"
+        )
+
+    def _render_history_program(self, program: Program) -> str:
+        metrics = ", ".join(
+            f"{name}={value:.3f}" for name, value in sorted(program.metrics.items())
+        ) or "unscored"
+        return (
+            "### History Program\n"
+            f"Program ID: {program.id}\n"
+            f"Primary score: {program.primary_score:.3f}\n"
+            f"Archive cell: {program.archive_cell}\n"
+            f"Metrics: {metrics}\n\n"
+            "```python\n"
+            f"{program.code.rstrip()}\n"
+            "```"
+        )
+
+    def _render_summary_program(self, program: Program) -> str:
+        excerpt = _head_tail_excerpt(program.code)
+        return (
+            "### History Program (Summary Only)\n"
+            f"Program ID: {program.id}\n"
+            f"Primary score: {program.primary_score:.3f}\n"
+            f"Archive cell: {program.archive_cell}\n"
+            "Compact excerpt because the prompt budget is nearly full.\n\n"
+            "```python\n"
+            f"{excerpt.rstrip()}\n"
+            "```"
+        )
+
+    def _rank_history(self, current_program: Program, history: Sequence[Program]) -> list[Program]:
+        current_cell = current_program.archive_cell
+
+        def diversity(program: Program) -> int:
+            if current_cell is None or program.archive_cell is None:
+                return abs(len(program.code) - len(current_program.code))
+            return abs(program.archive_cell[0] - current_cell[0]) + abs(
+                program.archive_cell[1] - current_cell[1]
+            )
+
+        deduped = {program.id: program for program in history if program.id != current_program.id}
+        return sorted(
+            deduped.values(),
+            key=lambda program: (program.primary_score, diversity(program)),
+            reverse=True,
+        )
