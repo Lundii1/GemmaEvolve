@@ -9,6 +9,9 @@ from alphaevolve.errors import PromptTooLargeError
 from alphaevolve.models import Program, PromptBudget
 from alphaevolve.token_estimator import CharacterTokenEstimator, TokenEstimator
 
+EVOLVE_BLOCK_START_MARKER = "# EVOLVE-BLOCK-START"
+EVOLVE_BLOCK_END_MARKER = "# EVOLVE-BLOCK-END"
+
 
 def _head_tail_excerpt(code: str, head_lines: int = 8, tail_lines: int = 8) -> str:
     lines = code.splitlines()
@@ -27,6 +30,37 @@ class RenderedPrompt:
     estimated_tokens: int
     included_program_ids: tuple[str, ...]
     summarized_program_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class EditWindow:
+    """Absolute character offsets for the editable code region."""
+
+    start: int
+    end: int
+    content: str
+
+
+def locate_edit_window(code: str) -> EditWindow | None:
+    """Return the code between EVOLVE-BLOCK markers when present."""
+    start_marker_index = code.find(EVOLVE_BLOCK_START_MARKER)
+    end_marker_index = code.find(EVOLVE_BLOCK_END_MARKER)
+    if start_marker_index == -1 and end_marker_index == -1:
+        return None
+    if start_marker_index == -1 or end_marker_index == -1 or start_marker_index >= end_marker_index:
+        return None
+
+    start_line_end = code.find("\n", start_marker_index)
+    if start_line_end == -1:
+        return None
+
+    editable_start = start_line_end + 1
+    editable_end = end_marker_index
+    return EditWindow(
+        start=editable_start,
+        end=editable_end,
+        content=code[editable_start:editable_end],
+    )
 
 
 class PromptBuilder:
@@ -48,10 +82,18 @@ class PromptBuilder:
         current_program: Program,
         history: Sequence[Program],
     ) -> RenderedPrompt:
-        system_section = self._render_system_section(system_instructions)
+        edit_window = locate_edit_window(current_program.code)
+        system_section = self._render_system_section(
+            system_instructions,
+            has_edit_window=edit_window is not None,
+        )
         task_section = self._render_task_section(task_contract)
+        boundary_section = self._render_edit_window(edit_window)
         current_section = self._render_current_program(current_program)
-        base_sections = [system_section, task_section, current_section]
+        base_sections = [system_section, task_section]
+        if boundary_section is not None:
+            base_sections.append(boundary_section)
+        base_sections.append(current_section)
         base_prompt = "\n\n".join(base_sections)
         base_tokens = self._token_estimator.estimate(base_prompt)
         if base_tokens > self._budget.usable_prompt_tokens:
@@ -100,11 +142,23 @@ class PromptBuilder:
             summarized_program_ids=tuple(summarized),
         )
 
-    def _render_system_section(self, system_instructions: str) -> str:
+    def _render_system_section(self, system_instructions: str, *, has_edit_window: bool) -> str:
+        rules = [
+            "Respond with SEARCH/REPLACE diff blocks only.",
+            "Do not include prose, explanations, bullet lists, or markdown fences.",
+            "History programs are reference-only; use them for ideas, not for SEARCH text.",
+            "Copy every SEARCH block exactly from the Current Program section.",
+        ]
+        if has_edit_window:
+            rules.append(
+                f"Only modify code between {EVOLVE_BLOCK_START_MARKER} and {EVOLVE_BLOCK_END_MARKER}."
+            )
+            rules.append("If an idea requires edits outside that boundary, do not propose it.")
+        rules_text = "\n".join(f"- {rule}" for rule in rules)
         return (
             "## System Instructions\n"
             f"{system_instructions.strip()}\n\n"
-            "Respond with SEARCH/REPLACE diff blocks only.\n"
+            f"{rules_text}\n\n"
             "Use this exact structure for every change:\n"
             "<<<<<<< SEARCH\n"
             "<old code>\n"
@@ -116,6 +170,17 @@ class PromptBuilder:
 
     def _render_task_section(self, task_contract: str) -> str:
         return f"## Task and Evaluation Contract\n{task_contract.strip()}"
+
+    def _render_edit_window(self, edit_window: EditWindow | None) -> str | None:
+        if edit_window is None:
+            return None
+        return (
+            "## Authorized Edit Window\n"
+            f"Only mutate code between {EVOLVE_BLOCK_START_MARKER} and {EVOLVE_BLOCK_END_MARKER}.\n\n"
+            "```python\n"
+            f"{edit_window.content.rstrip()}\n"
+            "```"
+        )
 
     def _render_current_program(self, program: Program) -> str:
         metrics = ", ".join(

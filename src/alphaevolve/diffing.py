@@ -28,6 +28,13 @@ def parse_diff(raw_text: str) -> Diff:
     matches = list(_DIFF_PATTERN.finditer(raw_text))
     if not matches:
         raise DiffParseError("No SEARCH/REPLACE blocks were found in the model response.")
+    cursor = 0
+    for match in matches:
+        if raw_text[cursor : match.start()].strip():
+            raise DiffParseError("Model response contained text outside SEARCH/REPLACE blocks.")
+        cursor = match.end()
+    if raw_text[cursor:].strip():
+        raise DiffParseError("Model response contained text outside SEARCH/REPLACE blocks.")
     blocks = tuple(
         DiffBlock(search=match.group(1), replace=match.group(2))
         for match in matches

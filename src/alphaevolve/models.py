@@ -62,7 +62,7 @@ class ModelConfig:
     provider: str = "fake"
     model: str = "gemma4:26b"
     base_url: str = "http://localhost:11434"
-    request_timeout_seconds: float = 60.0
+    request_timeout_seconds: float = 120.0
     temperature: float = 0.2
     prompt_budget: PromptBudget = field(default_factory=PromptBudget)
     scripted_responses: tuple[str, ...] = ()

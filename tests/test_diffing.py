@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from alphaevolve.diffing import apply_diff, parse_diff
-from alphaevolve.errors import DiffApplyError
+from alphaevolve.errors import DiffApplyError, DiffParseError
 
 
 def test_exact_match_diff_application() -> None:
@@ -62,3 +62,15 @@ def test_ambiguous_fuzzy_match_is_rejected() -> None:
     )
     with pytest.raises(DiffApplyError):
         apply_diff(source, diff)
+
+
+def test_prose_wrapped_diff_is_rejected() -> None:
+    with pytest.raises(DiffParseError):
+        parse_diff(
+            """Here is the requested diff:
+<<<<<<< SEARCH
+    return 1
+=======
+    return 2
+>>>>>>> REPLACE"""
+        )

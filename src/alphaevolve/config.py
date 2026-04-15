@@ -82,7 +82,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         provider=str(model_section.get("provider", "fake")),
         model=str(model_section.get("model", "gemma4:26b")),
         base_url=str(model_section.get("base_url", "http://localhost:11434")),
-        request_timeout_seconds=float(model_section.get("request_timeout_seconds", 60.0)),
+        request_timeout_seconds=float(model_section.get("request_timeout_seconds", 120.0)),
         temperature=float(model_section.get("temperature", 0.2)),
         prompt_budget=prompt_budget,
         scripted_responses=_as_str_tuple(model_section.get("scripted_responses")),

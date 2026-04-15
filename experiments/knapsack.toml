@@ -18,17 +18,17 @@ The current benchmark reaches the global optimum when score == 275.0.
 """
 
 [model]
-provider = "fake"
-model = "gemma4:26b"
+provider = "ollama"
+model = "gemma4:26b-a4b-it-q4_K_M"
 base_url = "http://localhost:11434"
-request_timeout_seconds = 60.0
+request_timeout_seconds = 180.0
 temperature = 0.2
 max_prompt_tokens = 12000
 reserved_completion_tokens = 2048
 max_history_programs = 4
 
 [sandbox]
-backend = "fake"
+backend = "docker"
 image = "python:3.12-slim"
 runtime = "runsc"
 network_mode = "none"
@@ -47,10 +47,10 @@ hall_of_fame_size = 20
 recent_per_cell = 5
 
 [controller]
-llm_concurrency = 2
-evaluation_concurrency = 2
-max_generations = 6
-max_pending_prompts = 4
+llm_concurrency = 1
+evaluation_concurrency = 4
+max_generations = 24
+max_pending_prompts = 1
 max_pending_evaluations = 4
 max_retries = 3
-metrics_interval_seconds = 2.0
+metrics_interval_seconds = 5.0

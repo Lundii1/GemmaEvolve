@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from time import perf_counter
 
 from alphaevolve.archive import ProgramDatabase
 from alphaevolve.diffing import apply_diff, parse_diff
@@ -13,7 +14,7 @@ from alphaevolve.evaluators import Evaluator
 from alphaevolve.llm import AsyncInferenceClient
 from alphaevolve.logging_utils import PipelineStats
 from alphaevolve.models import ExperimentConfig, Program, make_program_id
-from alphaevolve.prompts import PromptBuilder
+from alphaevolve.prompts import PromptBuilder, locate_edit_window
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +24,15 @@ class ControllerResult:
     best_program: Program
     stop_reason: str
     total_evaluated: int
+    total_generation_jobs: int
+    diff_parse_failures: int
+    diff_apply_failures: int
+    retry_count: int
+    sandbox_failures: int
+    latest_llm_latency_ms: float | None
+    latest_evaluation_latency_ms: float | None
+    sample_parse_failure_preview: str | None
+    sample_apply_failure_preview: str | None
 
 
 class EvolutionController:
@@ -55,11 +65,8 @@ class EvolutionController:
         """Evaluate the seed and drive the async mutation/evaluation pipeline."""
         await self._evaluate_and_record(seed_program)
         if self._target_reached():
-            return ControllerResult(
-                best_program=self._best_program,
-                stop_reason="target_score",
-                total_evaluated=self._stats.evaluation_count,
-            )
+            self._stop_reason = "target_score"
+            return self._build_result(self._best_program or seed_program)
 
         stop_event = asyncio.Event()
         prompt_queue: asyncio.Queue[Program | None] = asyncio.Queue(
@@ -96,11 +103,7 @@ class EvolutionController:
         best_program = self._best_program or seed_program
         if self._target_reached():
             self._stop_reason = "target_score"
-        return ControllerResult(
-            best_program=best_program,
-            stop_reason=self._stop_reason,
-            total_evaluated=self._stats.evaluation_count,
-        )
+        return self._build_result(best_program)
 
     async def _sampler(
         self,
@@ -154,30 +157,47 @@ class EvolutionController:
             )
         except PromptTooLargeError as exc:
             self._logger.error("Prompt budget exceeded for program %s: %s", parent.id, exc)
-            self._stats.diff_failures += 1
             return None
 
         for attempt in range(1, self._config.controller.max_retries + 1):
+            raw_preview: str | None = None
             try:
+                started = perf_counter()
                 async with self._llm_semaphore:
                     raw_diff = await self._inference_client.generate_diff(rendered_prompt.text, attempt=attempt)
+                self._stats.record_llm_latency((perf_counter() - started) * 1_000)
+                raw_preview = _sanitize_response_preview(raw_diff)
                 parsed = parse_diff(raw_diff)
                 child_code = apply_diff(parent.code, parsed)
+                _enforce_edit_window(parent.code, child_code)
                 return Program(
                     id=make_program_id(),
                     code=child_code,
                     parent_id=parent.id,
                 )
-            except (DiffParseError, DiffApplyError) as exc:
-                self._stats.diff_failures += 1
+            except DiffParseError as exc:
+                self._stats.record_diff_parse_failure(raw_preview)
                 if attempt < self._config.controller.max_retries:
                     self._stats.retry_count += 1
                 self._logger.warning(
-                    "Diff attempt %s/%s failed for parent %s: %s",
+                    "Diff parse attempt %s/%s failed for parent %s: %s preview=%s",
                     attempt,
                     self._config.controller.max_retries,
                     parent.id,
                     exc,
+                    raw_preview or "<empty>",
+                )
+            except DiffApplyError as exc:
+                self._stats.record_diff_apply_failure(raw_preview)
+                if attempt < self._config.controller.max_retries:
+                    self._stats.retry_count += 1
+                self._logger.warning(
+                    "Diff apply attempt %s/%s failed for parent %s: %s preview=%s",
+                    attempt,
+                    self._config.controller.max_retries,
+                    parent.id,
+                    exc,
+                    raw_preview or "<empty>",
                 )
         return None
 
@@ -199,10 +219,12 @@ class EvolutionController:
 
     async def _evaluate_and_record(self, program: Program) -> Program:
         async with self._evaluation_semaphore:
+            started = perf_counter()
             metrics, execution = await self._evaluator.evaluate(
                 program,
                 primary_metric=self._config.primary_metric,
             )
+            self._stats.record_evaluation_latency((perf_counter() - started) * 1_000)
         program.metrics = metrics
         program.execution = execution
         program.primary_score = metrics.get(self._config.primary_metric, float("-inf"))
@@ -236,3 +258,38 @@ class EvolutionController:
 
     def _target_reached(self) -> bool:
         return bool(self._best_program and self._best_program.primary_score >= self._config.target_score)
+
+    def _build_result(self, best_program: Program) -> ControllerResult:
+        return ControllerResult(
+            best_program=best_program,
+            stop_reason=self._stop_reason,
+            total_evaluated=self._stats.evaluation_count,
+            total_generation_jobs=self._stats.mutation_jobs_started,
+            diff_parse_failures=self._stats.diff_parse_failures,
+            diff_apply_failures=self._stats.diff_apply_failures,
+            retry_count=self._stats.retry_count,
+            sandbox_failures=self._stats.sandbox_failures,
+            latest_llm_latency_ms=self._stats.latest_llm_latency_ms,
+            latest_evaluation_latency_ms=self._stats.latest_evaluation_latency_ms,
+            sample_parse_failure_preview=self._stats.sample_parse_failure_preview,
+            sample_apply_failure_preview=self._stats.sample_apply_failure_preview,
+        )
+
+
+def _sanitize_response_preview(raw_text: str, limit: int = 240) -> str:
+    preview = raw_text.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+    if len(preview) <= limit:
+        return preview
+    return f"{preview[:limit]}..."
+
+
+def _enforce_edit_window(source: str, updated: str) -> None:
+    edit_window = locate_edit_window(source)
+    if edit_window is None:
+        return
+    prefix = source[: edit_window.start]
+    suffix = source[edit_window.end :]
+    if not updated.startswith(prefix):
+        raise DiffApplyError("Diff modified code before the EVOLVE-BLOCK start marker.")
+    if suffix and not updated.endswith(suffix):
+        raise DiffApplyError("Diff modified code after the EVOLVE-BLOCK end marker.")

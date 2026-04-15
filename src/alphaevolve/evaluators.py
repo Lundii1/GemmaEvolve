@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-import shutil
 import tempfile
 import traceback
 from abc import ABC, abstractmethod
@@ -178,22 +177,36 @@ def _metrics_from_stdout(stdout: str, primary_metric: str) -> dict[str, float]:
     return {name: float(value) for name, value in payload.items()}
 
 
-def docker_environment_status() -> tuple[bool, str]:
+def docker_environment_status(runtime_name: str = "runsc") -> tuple[bool, str]:
     """Return whether Docker and the required gVisor runtime appear available."""
-    if shutil.which("docker") is None:
-        return False, "docker CLI not found on PATH"
-    if shutil.which("runsc") is None:
-        return False, "runsc not found on PATH"
+    if runtime_name != "runsc":
+        return False, f"Sandbox runtime must be 'runsc', got {runtime_name!r}"
     try:
         import docker  # type: ignore
     except ImportError:
         return False, "docker Python package is not installed"
+    client = None
     try:
         client = docker.from_env()
         client.ping()
-        client.close()
+        info = client.info()
     except Exception as exc:
         return False, str(exc)
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+    runtimes = info.get("Runtimes", {})
+    if isinstance(runtimes, dict):
+        available_runtimes = set(runtimes)
+    elif isinstance(runtimes, list):
+        available_runtimes = {str(item) for item in runtimes}
+    else:
+        available_runtimes = set()
+    if "runsc" not in available_runtimes:
+        return False, "Docker daemon does not report the 'runsc' runtime"
     return True, "ok"
 
 
