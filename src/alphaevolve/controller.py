@@ -1,11 +1,16 @@
-"""Asynchronous orchestration loop."""
+"""Serial-first orchestration loop with islands, checkpoints, and prompt logs."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import random
+import signal
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
+from typing import Any
 
 from alphaevolve.archive import ProgramDatabase
 from alphaevolve.diffing import apply_diff, parse_diff
@@ -13,7 +18,19 @@ from alphaevolve.errors import DiffApplyError, DiffParseError, PromptTooLargeErr
 from alphaevolve.evaluators import Evaluator
 from alphaevolve.llm import AsyncInferenceClient
 from alphaevolve.logging_utils import PipelineStats
-from alphaevolve.models import ExperimentConfig, Program, make_program_id
+from alphaevolve.models import (
+    CheckpointState,
+    EvaluationResult,
+    ExecutionResult,
+    ExperimentConfig,
+    Program,
+    PromptArtifactContext,
+    PromptLog,
+    decode_random_state,
+    encode_random_state,
+    make_program_id,
+    make_prompt_log_id,
+)
 from alphaevolve.prompts import PromptBuilder, locate_edit_window
 
 
@@ -33,148 +50,229 @@ class ControllerResult:
     latest_evaluation_latency_ms: float | None
     sample_parse_failure_preview: str | None
     sample_apply_failure_preview: str | None
+    run_dir: Path
 
 
 class EvolutionController:
-    """Run the AlphaEvolve sample/generate/evaluate loop asynchronously."""
+    """Run the AlphaEvolve sample/generate/evaluate loop serially."""
 
     def __init__(
         self,
         *,
         config: ExperimentConfig,
-        archive: ProgramDatabase,
+        database: ProgramDatabase,
         inference_client: AsyncInferenceClient,
         evaluator: Evaluator,
         prompt_builder: PromptBuilder,
+        run_dir: str | Path,
         logger: logging.Logger | None = None,
     ) -> None:
         self._config = config
-        self._archive = archive
+        self._database = database
         self._inference_client = inference_client
         self._evaluator = evaluator
         self._prompt_builder = prompt_builder
+        self._run_dir = Path(run_dir).resolve()
+        self._checkpoint_path = self._run_dir / "checkpoint.json"
         self._logger = logger or logging.getLogger("alphaevolve.controller")
         self._stats = PipelineStats()
-        self._llm_semaphore = asyncio.Semaphore(config.controller.llm_concurrency)
-        self._evaluation_semaphore = asyncio.Semaphore(config.controller.evaluation_concurrency)
-        self._archive_lock = asyncio.Lock()
         self._best_program: Program | None = None
         self._stop_reason = "generation_limit"
+        self._generation = 0
+        self._next_island_index = 0
+        self._stagnation_generations = 0
+        self._last_metrics_log_at = perf_counter()
+        self._stop_requested = False
+        self._signal_stop_reason = "signal"
+        self._random = random.Random()
 
     async def run(self, seed_program: Program) -> ControllerResult:
-        """Evaluate the seed and drive the async mutation/evaluation pipeline."""
-        await self._evaluate_and_record(seed_program)
-        if self._target_reached():
-            self._stop_reason = "target_score"
-            return self._build_result(self._best_program or seed_program)
+        """Evaluate the seed and drive the mutation/evaluation pipeline."""
+        self._run_dir.mkdir(parents=True, exist_ok=True)
+        self._restore_checkpoint_if_present()
+        with _signal_guard(self._request_stop):
+            try:
+                if self._database.best_program() is None:
+                    await self._evaluate_seed(seed_program)
+                    self._best_program = self._database.best_program()
+                    if self._target_reached():
+                        self._stop_reason = "target_score"
+                else:
+                    self._best_program = self._database.best_program()
 
-        stop_event = asyncio.Event()
-        prompt_queue: asyncio.Queue[Program | None] = asyncio.Queue(
-            maxsize=self._config.controller.max_pending_prompts
-        )
-        evaluation_queue: asyncio.Queue[Program | None] = asyncio.Queue(
-            maxsize=self._config.controller.max_pending_evaluations
-        )
+                if not self._target_reached():
+                    while self._generation < self._config.controller.max_generations:
+                        if self._stop_requested:
+                            self._stop_reason = self._signal_stop_reason
+                            break
+                        island_id = self._next_island_index
+                        self._next_island_index = (self._next_island_index + 1) % self._config.database.islands
+                        await self._run_generation(island_id=island_id)
+                        self._generation += 1
+                        self._maybe_log_metrics()
 
-        stats_task = asyncio.create_task(self._stats_loop(stop_event, prompt_queue, evaluation_queue))
-        evaluation_tasks = [
-            asyncio.create_task(self._evaluation_worker(evaluation_queue, stop_event))
-            for _ in range(self._config.controller.evaluation_concurrency)
-        ]
-        llm_tasks = [
-            asyncio.create_task(self._llm_worker(prompt_queue, evaluation_queue, stop_event))
-            for _ in range(self._config.controller.llm_concurrency)
-        ]
-        sampler_task = asyncio.create_task(self._sampler(prompt_queue, stop_event))
+                        if self._target_reached():
+                            self._stop_reason = "target_score"
+                            break
+                        if self._stagnation_generations >= self._config.controller.stagnation_patience:
+                            self._stop_reason = "stagnation"
+                            break
+                        await self._maybe_checkpoint(force=False)
+                    else:
+                        self._stop_reason = "generation_limit"
+            finally:
+                await self._finalize()
 
-        try:
-            await sampler_task
-            await asyncio.gather(*llm_tasks)
-            for _ in evaluation_tasks:
-                await evaluation_queue.put(None)
-            await asyncio.gather(*evaluation_tasks)
-        finally:
-            stop_event.set()
-            stats_task.cancel()
-            await asyncio.gather(stats_task, return_exceptions=True)
-            await self._inference_client.aclose()
-            await self._evaluator.aclose()
-
-        best_program = self._best_program or seed_program
-        if self._target_reached():
-            self._stop_reason = "target_score"
+        best_program = self._best_program or self._database.best_program() or seed_program
         return self._build_result(best_program)
 
-    async def _sampler(
-        self,
-        prompt_queue: asyncio.Queue[Program | None],
-        stop_event: asyncio.Event,
-    ) -> None:
-        try:
-            while not stop_event.is_set():
-                async with self._archive_lock:
-                    if self._stats.mutation_jobs_started >= self._config.controller.max_generations:
-                        break
-                    parent = self._archive.sample()
-                    self._stats.mutation_jobs_started += 1
-                await prompt_queue.put(parent)
-        finally:
-            for _ in range(self._config.controller.llm_concurrency):
-                await prompt_queue.put(None)
+    async def _evaluate_seed(self, seed_program: Program) -> None:
+        result = await self._evaluator.evaluate(
+            seed_program,
+            primary_metric=self._config.primary_metric,
+            artifact_dir=self._database.root_dir / "artifacts" / seed_program.id,
+        )
+        self._stats.record_evaluation_latency(result.execution.duration_ms)
+        self._stats.evaluation_count += 1
+        if result.status not in {"success", "pending"}:
+            self._stats.sandbox_failures += 1
+        seed_program.metrics = result.metrics
+        seed_program.features = result.features
+        seed_program.execution = result.execution
+        seed_program.evaluation = result
+        seed_program.primary_score = result.primary_score
+        seed_program.artifact_records = result.artifacts
+        seed_program.accepted = result.status == "success" and result.rejection_reason is None
+        seed_program.rejection_reason = result.rejection_reason
+        self._database.record_seed_across_islands(seed_program)
+        self._stats.best_score = seed_program.primary_score
+        await self._maybe_checkpoint(force=True)
 
-    async def _llm_worker(
-        self,
-        prompt_queue: asyncio.Queue[Program | None],
-        evaluation_queue: asyncio.Queue[Program | None],
-        stop_event: asyncio.Event,
-    ) -> None:
-        while True:
-            parent = await prompt_queue.get()
-            try:
-                if parent is None:
-                    return
-                if stop_event.is_set():
-                    continue
-                child = await self._propose_child(parent)
-                if child is not None:
-                    await evaluation_queue.put(child)
-            finally:
-                prompt_queue.task_done()
-
-    async def _propose_child(self, parent: Program) -> Program | None:
-        async with self._archive_lock:
-            history = self._archive.promising_programs(
-                self._config.model.prompt_budget.max_history_programs,
-                exclude_id=parent.id,
-            )
+    async def _run_generation(self, *, island_id: int) -> None:
+        parent = self._database.sample(island_id)
+        history = self._database.promising_programs(
+            self._config.model.prompt_budget.max_history_programs,
+            island_id=island_id,
+            exclude_id=parent.id,
+        )
+        parent_view = Program.from_dict(parent.to_dict())
+        parent_view.island_id = island_id
+        artifact_context = self._artifact_context(parent, history)
+        evaluator_feedback = parent.evaluation.feedback if parent.evaluation else None
 
         try:
             rendered_prompt = self._prompt_builder.build(
                 system_instructions=self._config.system_instructions,
                 task_contract=f"{self._config.task_description}\n\n{self._config.evaluation_contract}",
-                current_program=parent,
+                current_program=parent_view,
                 history=history,
+                artifact_context=artifact_context,
+                evaluator_feedback=evaluator_feedback,
             )
         except PromptTooLargeError as exc:
             self._logger.error("Prompt budget exceeded for program %s: %s", parent.id, exc)
-            return None
+            self._stagnation_generations += 1
+            return
 
+        prompt_log = self._database.record_prompt_log(
+            PromptLog(
+                id=make_prompt_log_id(),
+                parent_id=parent.id,
+                island_id=island_id,
+                prompt_text=rendered_prompt.text,
+                estimated_tokens=rendered_prompt.estimated_tokens,
+                included_program_ids=rendered_prompt.included_program_ids,
+                summarized_program_ids=rendered_prompt.summarized_program_ids,
+                artifact_context=rendered_prompt.artifact_context,
+                evaluator_feedback_used=rendered_prompt.evaluator_feedback_used,
+            )
+        )
+        self._stats.mutation_jobs_started += 1
+        child = await self._propose_child(
+            parent=parent,
+            island_id=island_id,
+            prompt_text=rendered_prompt.text,
+            prompt_log_id=prompt_log.id,
+        )
+        if child is None:
+            self._stagnation_generations += 1
+            return
+
+        novelty_rejection = self._database.preflight_candidate(child, island_id=island_id)
+        if novelty_rejection is not None:
+            child.accepted = False
+            child.rejection_reason = novelty_rejection
+            child.evaluation = EvaluationResult(
+                status="rejected",
+                primary_score=float("-inf"),
+                metrics={self._config.primary_metric: 0.0},
+                execution=ExecutionResult(status="rejected"),
+                feedback=None,
+                rejection_reason=novelty_rejection,
+            )
+            child.execution = child.evaluation.execution
+            child.metrics = child.evaluation.metrics
+            child.primary_score = child.evaluation.primary_score
+            self._database.record(child)
+            self._stagnation_generations += 1
+            return
+
+        evaluated = await self._evaluate_candidate(child)
+        if evaluated.accepted and (
+            self._best_program is None or evaluated.primary_score > self._best_program.primary_score
+        ):
+            self._best_program = evaluated
+            self._stats.best_score = evaluated.primary_score
+            self._stagnation_generations = 0
+            await self._maybe_checkpoint(force=True)
+        else:
+            self._stagnation_generations += 1
+        migration = self._database.maybe_migrate(
+            generation=self._generation + 1,
+            source_island_id=island_id,
+        )
+        if migration is not None:
+            target_island, program_id = migration
+            self._logger.info(
+                "migration_complete source_island=%s target_island=%s program_id=%s",
+                island_id,
+                target_island,
+                program_id,
+            )
+
+    async def _propose_child(
+        self,
+        *,
+        parent: Program,
+        island_id: int,
+        prompt_text: str,
+        prompt_log_id: str,
+    ) -> Program | None:
+        raw_preview: str | None = None
         for attempt in range(1, self._config.controller.max_retries + 1):
-            raw_preview: str | None = None
             try:
                 started = perf_counter()
-                async with self._llm_semaphore:
-                    raw_diff = await self._inference_client.generate_diff(rendered_prompt.text, attempt=attempt)
+                raw_diff = await self._inference_client.generate_diff(prompt_text, attempt=attempt)
                 self._stats.record_llm_latency((perf_counter() - started) * 1_000)
                 raw_preview = _sanitize_response_preview(raw_diff)
                 parsed = parse_diff(raw_diff)
                 child_code = apply_diff(parent.code, parsed)
                 _enforce_edit_window(parent.code, child_code)
-                return Program(
+                child = Program(
                     id=make_program_id(),
                     code=child_code,
                     parent_id=parent.id,
+                    generation=self._generation + 1,
+                    island_id=island_id,
+                    prompt_log_id=prompt_log_id,
+                    lineage_depth=parent.lineage_depth + 1,
                 )
+                self._database.update_prompt_log(
+                    prompt_log_id,
+                    model_response=raw_diff,
+                    child_id=child.id,
+                )
+                return child
             except DiffParseError as exc:
                 self._stats.record_diff_parse_failure(raw_preview)
                 if attempt < self._config.controller.max_retries:
@@ -199,62 +297,80 @@ class EvolutionController:
                     exc,
                     raw_preview or "<empty>",
                 )
+        if raw_preview is not None:
+            self._database.update_prompt_log(
+                prompt_log_id,
+                model_response=raw_preview,
+                child_id=None,
+            )
         return None
 
-    async def _evaluation_worker(
-        self,
-        evaluation_queue: asyncio.Queue[Program | None],
-        stop_event: asyncio.Event,
-    ) -> None:
-        while True:
-            candidate = await evaluation_queue.get()
-            try:
-                if candidate is None:
-                    return
-                await self._evaluate_and_record(candidate)
-                if self._target_reached():
-                    stop_event.set()
-            finally:
-                evaluation_queue.task_done()
-
-    async def _evaluate_and_record(self, program: Program) -> Program:
-        async with self._evaluation_semaphore:
-            started = perf_counter()
-            metrics, execution = await self._evaluator.evaluate(
-                program,
-                primary_metric=self._config.primary_metric,
-            )
-            self._stats.record_evaluation_latency((perf_counter() - started) * 1_000)
-        program.metrics = metrics
-        program.execution = execution
-        program.primary_score = metrics.get(self._config.primary_metric, float("-inf"))
-        async with self._archive_lock:
-            self._archive.record(program)
-            self._best_program = self._archive.best_program()
-            self._stats.evaluation_count += 1
-            self._stats.best_score = (
-                self._best_program.primary_score if self._best_program else self._stats.best_score
-            )
-            if execution.status not in {"success", "pending"}:
-                self._stats.sandbox_failures += 1
+    async def _evaluate_candidate(self, program: Program) -> Program:
+        started = perf_counter()
+        result = await self._evaluator.evaluate(
+            program,
+            primary_metric=self._config.primary_metric,
+            artifact_dir=self._database.root_dir / "artifacts" / program.id,
+        )
+        self._stats.record_evaluation_latency((perf_counter() - started) * 1_000)
+        self._stats.evaluation_count += 1
+        if result.status not in {"success", "pending"}:
+            self._stats.sandbox_failures += 1
+        program.metrics = result.metrics
+        program.features = result.features
+        program.execution = result.execution
+        program.evaluation = result
+        program.primary_score = result.primary_score
+        program.artifact_records = result.artifacts
+        program.accepted = result.status == "success" and result.rejection_reason is None
+        program.rejection_reason = result.rejection_reason
+        self._database.record(program)
+        if self._best_program is None:
+            self._best_program = self._database.best_program()
         return program
 
-    async def _stats_loop(
-        self,
-        stop_event: asyncio.Event,
-        prompt_queue: asyncio.Queue[Program | None],
-        evaluation_queue: asyncio.Queue[Program | None],
-    ) -> None:
-        try:
-            while not stop_event.is_set():
-                await asyncio.sleep(self._config.controller.metrics_interval_seconds)
-                snapshot = self._stats.snapshot(
-                    pending_prompts=prompt_queue.qsize(),
-                    pending_evaluations=evaluation_queue.qsize(),
-                )
-                self._logger.info("pipeline_stats=%s archive=%s", snapshot, self._archive.stats())
-        except asyncio.CancelledError:
+    def _restore_checkpoint_if_present(self) -> None:
+        resume_from = self._config.checkpoint.resume_from
+        if resume_from is not None:
+            checkpoint_path = resume_from / "checkpoint.json"
+        else:
+            checkpoint_path = self._checkpoint_path
+        if not checkpoint_path.exists():
+            self._best_program = self._database.best_program()
             return
+        payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        state = CheckpointState.from_dict(payload)
+        self._generation = state.generation
+        self._next_island_index = state.next_island_index
+        self._stagnation_generations = state.stagnation_generations
+        self._stop_reason = state.stop_reason or self._stop_reason
+        self._random.setstate(decode_random_state(state.random_state))
+        if state.best_program_id is not None:
+            self._best_program = self._database.get_program(state.best_program_id)
+        else:
+            self._best_program = self._database.best_program()
+
+    async def _maybe_checkpoint(self, *, force: bool) -> None:
+        if not self._config.checkpoint.enabled:
+            return
+        interval = max(self._config.checkpoint.interval_generations, 1)
+        if not force and self._generation > 0 and self._generation % interval != 0:
+            return
+        state = CheckpointState(
+            generation=self._generation,
+            best_program_id=self._best_program.id if self._best_program is not None else None,
+            next_island_index=self._next_island_index,
+            stagnation_generations=self._stagnation_generations,
+            stop_reason=self._stop_reason,
+            random_state=encode_random_state(self._random.getstate()),
+        )
+        self._checkpoint_path.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
+        self._database.save()
+
+    async def _finalize(self) -> None:
+        await self._maybe_checkpoint(force=True)
+        await self._inference_client.aclose()
+        await self._evaluator.aclose()
 
     def _target_reached(self) -> bool:
         return bool(self._best_program and self._best_program.primary_score >= self._config.target_score)
@@ -273,7 +389,44 @@ class EvolutionController:
             latest_evaluation_latency_ms=self._stats.latest_evaluation_latency_ms,
             sample_parse_failure_preview=self._stats.sample_parse_failure_preview,
             sample_apply_failure_preview=self._stats.sample_apply_failure_preview,
+            run_dir=self._run_dir,
         )
+
+    def _artifact_context(
+        self,
+        parent: Program,
+        history: list[Program],
+    ) -> tuple[PromptArtifactContext, ...]:
+        contexts: list[PromptArtifactContext] = []
+        seen: set[tuple[str, str]] = set()
+        for program in [parent, *history]:
+            for artifact in program.artifact_records:
+                if not artifact.summary:
+                    continue
+                key = (artifact.name, artifact.summary)
+                if key in seen:
+                    continue
+                contexts.append(
+                    PromptArtifactContext(
+                        name=artifact.name,
+                        type=artifact.type,
+                        summary=artifact.summary,
+                    )
+                )
+                seen.add(key)
+                if len(contexts) >= self._config.model.prompt_budget.max_artifact_context:
+                    return tuple(contexts)
+        return tuple(contexts)
+
+    def _maybe_log_metrics(self) -> None:
+        if perf_counter() - self._last_metrics_log_at < self._config.controller.metrics_interval_seconds:
+            return
+        self._last_metrics_log_at = perf_counter()
+        snapshot = self._stats.snapshot(pending_prompts=0, pending_evaluations=0)
+        self._logger.info("pipeline_stats=%s database=%s", snapshot, self._database.stats())
+
+    def _request_stop(self) -> None:
+        self._stop_requested = True
 
 
 def _sanitize_response_preview(raw_text: str, limit: int = 240) -> str:
@@ -293,3 +446,34 @@ def _enforce_edit_window(source: str, updated: str) -> None:
         raise DiffApplyError("Diff modified code before the EVOLVE-BLOCK start marker.")
     if suffix and not updated.endswith(suffix):
         raise DiffApplyError("Diff modified code after the EVOLVE-BLOCK end marker.")
+
+
+class _signal_guard:
+    """Temporarily request a graceful stop on SIGINT/SIGTERM."""
+
+    def __init__(self, callback) -> None:
+        self._callback = callback
+        self._previous: dict[int, Any] = {}
+
+    def __enter__(self):
+        for signame in ("SIGINT", "SIGTERM"):
+            signum = getattr(signal, signame, None)
+            if signum is None:
+                continue
+            try:
+                self._previous[signum] = signal.getsignal(signum)
+                signal.signal(signum, self._handle)
+            except (ValueError, OSError):
+                continue
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for signum, previous in self._previous.items():
+            try:
+                signal.signal(signum, previous)
+            except (ValueError, OSError):
+                continue
+        return False
+
+    def _handle(self, signum, frame) -> None:
+        self._callback()

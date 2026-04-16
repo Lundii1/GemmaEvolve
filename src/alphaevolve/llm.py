@@ -1,29 +1,25 @@
-"""Inference clients for local models and deterministic tests."""
+"""Inference clients for local models."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections import deque
-from typing import Callable, Sequence
 
 import httpx
 
 from alphaevolve.errors import CapabilityUnavailableError
 from alphaevolve.models import ModelConfig
 
-DEFAULT_KNAPSACK_DIFF = """<<<<<<< SEARCH
-    return value
-=======
-    return value / max(weight, 1e-9)
->>>>>>> REPLACE"""
-
 
 class AsyncInferenceClient(ABC):
     """Abstract async inference interface."""
 
     @abstractmethod
+    async def generate_text(self, prompt: str, *, attempt: int = 1) -> str:
+        """Generate text for a given prompt."""
+
     async def generate_diff(self, prompt: str, *, attempt: int = 1) -> str:
-        """Generate a diff-like response for a given prompt."""
+        """Backward-compatible helper for diff prompts."""
+        return await self.generate_text(prompt, attempt=attempt)
 
     async def aclose(self) -> None:
         """Optional async cleanup hook."""
@@ -39,7 +35,7 @@ class OllamaClient(AsyncInferenceClient):
             timeout=config.request_timeout_seconds,
         )
 
-    async def generate_diff(self, prompt: str, *, attempt: int = 1) -> str:
+    async def generate_text(self, prompt: str, *, attempt: int = 1) -> str:
         payload = {
             "model": self._config.model,
             "prompt": prompt,
@@ -54,28 +50,10 @@ class OllamaClient(AsyncInferenceClient):
         message = body.get("message", {})
         if isinstance(message, dict) and "content" in message:
             return str(message["content"])
-        raise CapabilityUnavailableError("Ollama response did not contain a generated diff.")
+        raise CapabilityUnavailableError("Ollama response did not contain generated text.")
 
     async def aclose(self) -> None:
         await self._client.aclose()
-
-
-class FakeInferenceClient(AsyncInferenceClient):
-    """Deterministic fake client for tests and offline benchmarks."""
-
-    def __init__(
-        self,
-        responses: Sequence[str] | None = None,
-        *,
-        fallback: Callable[[str, int], str] | None = None,
-    ) -> None:
-        self._responses = deque(responses or [])
-        self._fallback = fallback or (lambda prompt, attempt: DEFAULT_KNAPSACK_DIFF)
-
-    async def generate_diff(self, prompt: str, *, attempt: int = 1) -> str:
-        if self._responses:
-            return self._responses.popleft()
-        return self._fallback(prompt, attempt)
 
 
 async def check_ollama_availability(base_url: str, timeout_seconds: float = 2.0) -> tuple[bool, str]:
@@ -94,6 +72,4 @@ def build_inference_client(config: ModelConfig) -> AsyncInferenceClient:
     provider = config.provider.lower()
     if provider == "ollama":
         return OllamaClient(config)
-    if provider == "fake":
-        return FakeInferenceClient(config.scripted_responses)
     raise CapabilityUnavailableError(f"Unsupported inference provider: {config.provider}")

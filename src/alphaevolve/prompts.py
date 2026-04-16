@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from alphaevolve.errors import PromptTooLargeError
-from alphaevolve.models import Program, PromptBudget
+from alphaevolve.models import Program, PromptArtifactContext, PromptBudget
 from alphaevolve.token_estimator import CharacterTokenEstimator, TokenEstimator
 
 EVOLVE_BLOCK_START_MARKER = "# EVOLVE-BLOCK-START"
@@ -30,6 +30,8 @@ class RenderedPrompt:
     estimated_tokens: int
     included_program_ids: tuple[str, ...]
     summarized_program_ids: tuple[str, ...]
+    artifact_context: tuple[PromptArtifactContext, ...]
+    evaluator_feedback_used: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +83,8 @@ class PromptBuilder:
         task_contract: str,
         current_program: Program,
         history: Sequence[Program],
+        artifact_context: Sequence[PromptArtifactContext] = (),
+        evaluator_feedback: str | None = None,
     ) -> RenderedPrompt:
         edit_window = locate_edit_window(current_program.code)
         system_section = self._render_system_section(
@@ -90,7 +94,13 @@ class PromptBuilder:
         task_section = self._render_task_section(task_contract)
         boundary_section = self._render_edit_window(edit_window)
         current_section = self._render_current_program(current_program)
+        feedback_section = self._render_feedback(evaluator_feedback)
+        artifact_section, used_artifacts = self._render_artifacts(artifact_context)
         base_sections = [system_section, task_section]
+        if feedback_section is not None:
+            base_sections.append(feedback_section)
+        if artifact_section is not None:
+            base_sections.append(artifact_section)
         if boundary_section is not None:
             base_sections.append(boundary_section)
         base_sections.append(current_section)
@@ -140,6 +150,8 @@ class PromptBuilder:
             estimated_tokens=estimated_tokens,
             included_program_ids=tuple(included),
             summarized_program_ids=tuple(summarized),
+            artifact_context=tuple(used_artifacts),
+            evaluator_feedback_used=evaluator_feedback,
         )
 
     def _render_system_section(self, system_instructions: str, *, has_edit_window: bool) -> str:
@@ -171,6 +183,23 @@ class PromptBuilder:
     def _render_task_section(self, task_contract: str) -> str:
         return f"## Task and Evaluation Contract\n{task_contract.strip()}"
 
+    def _render_feedback(self, evaluator_feedback: str | None) -> str | None:
+        if not evaluator_feedback:
+            return None
+        return f"## Evaluator Feedback\n{evaluator_feedback.strip()}"
+
+    def _render_artifacts(
+        self,
+        artifact_context: Sequence[PromptArtifactContext],
+    ) -> tuple[str | None, tuple[PromptArtifactContext, ...]]:
+        limited = tuple(artifact_context[: self._budget.max_artifact_context])
+        if not limited:
+            return None, ()
+        lines = ["## Artifact Summaries"]
+        for artifact in limited:
+            lines.append(f"- {artifact.name} ({artifact.type}): {artifact.summary}")
+        return "\n".join(lines), limited
+
     def _render_edit_window(self, edit_window: EditWindow | None) -> str | None:
         if edit_window is None:
             return None
@@ -186,11 +215,16 @@ class PromptBuilder:
         metrics = ", ".join(
             f"{name}={value:.3f}" for name, value in sorted(program.metrics.items())
         ) or "unscored"
+        features = ", ".join(
+            f"{name}={value:.3f}" for name, value in sorted(program.features.items())
+        ) or "none"
         return (
             "## Current Program\n"
             f"Program ID: {program.id}\n"
             f"Parent ID: {program.parent_id or 'none'}\n"
-            f"Latest metrics: {metrics}\n\n"
+            f"Island ID: {program.island_id}\n"
+            f"Latest metrics: {metrics}\n"
+            f"Latest features: {features}\n\n"
             "```python\n"
             f"{program.code.rstrip()}\n"
             "```"
@@ -200,12 +234,15 @@ class PromptBuilder:
         metrics = ", ".join(
             f"{name}={value:.3f}" for name, value in sorted(program.metrics.items())
         ) or "unscored"
+        artifact_summary = self._artifact_summary(program)
+        artifact_line = f"\nArtifact summaries: {artifact_summary}" if artifact_summary else ""
         return (
             "### History Program\n"
             f"Program ID: {program.id}\n"
             f"Primary score: {program.primary_score:.3f}\n"
+            f"Island ID: {program.island_id}\n"
             f"Archive cell: {program.archive_cell}\n"
-            f"Metrics: {metrics}\n\n"
+            f"Metrics: {metrics}{artifact_line}\n\n"
             "```python\n"
             f"{program.code.rstrip()}\n"
             "```"
@@ -217,6 +254,7 @@ class PromptBuilder:
             "### History Program (Summary Only)\n"
             f"Program ID: {program.id}\n"
             f"Primary score: {program.primary_score:.3f}\n"
+            f"Island ID: {program.island_id}\n"
             f"Archive cell: {program.archive_cell}\n"
             "Compact excerpt because the prompt budget is nearly full.\n\n"
             "```python\n"
@@ -224,14 +262,21 @@ class PromptBuilder:
             "```"
         )
 
+    def _artifact_summary(self, program: Program) -> str | None:
+        summaries = [record.summary for record in program.artifact_records if record.summary]
+        if not summaries:
+            return None
+        return " | ".join(summaries[:2])
+
     def _rank_history(self, current_program: Program, history: Sequence[Program]) -> list[Program]:
         current_cell = current_program.archive_cell
 
         def diversity(program: Program) -> int:
             if current_cell is None or program.archive_cell is None:
                 return abs(len(program.code) - len(current_program.code))
-            return abs(program.archive_cell[0] - current_cell[0]) + abs(
-                program.archive_cell[1] - current_cell[1]
+            return sum(
+                abs(program_dim - current_dim)
+                for program_dim, current_dim in zip(program.archive_cell, current_cell)
             )
 
         deduped = {program.id: program for program in history if program.id != current_program.id}

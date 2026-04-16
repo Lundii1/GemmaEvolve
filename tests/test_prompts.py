@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from alphaevolve.errors import PromptTooLargeError
-from alphaevolve.models import Program, PromptBudget
+from alphaevolve.models import Program, PromptArtifactContext, PromptBudget
 from alphaevolve.prompts import PromptBuilder
 
 
@@ -55,7 +55,7 @@ def test_prompt_raises_when_current_program_alone_exceeds_budget() -> None:
         )
 
 
-def test_prompt_includes_authorized_edit_window_instructions_when_markers_present() -> None:
+def test_prompt_includes_feedback_and_artifact_summaries() -> None:
     builder = PromptBuilder(PromptBudget(max_prompt_tokens=600, reserved_completion_tokens=50, max_history_programs=1))
     current = Program(
         id="current",
@@ -73,8 +73,13 @@ def test_prompt_includes_authorized_edit_window_instructions_when_markers_presen
         task_contract="Maximize score.",
         current_program=current,
         history=[],
+        artifact_context=(
+            PromptArtifactContext(name="report", type="json", summary="score=10"),
+        ),
+        evaluator_feedback="Try improving the ratio heuristic.",
     )
 
     assert "## Authorized Edit Window" in rendered.text
     assert "History programs are reference-only" in rendered.text
-    assert "Only modify code between # EVOLVE-BLOCK-START and # EVOLVE-BLOCK-END." in rendered.text
+    assert "## Artifact Summaries" in rendered.text
+    assert "## Evaluator Feedback" in rendered.text

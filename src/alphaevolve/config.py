@@ -8,11 +8,20 @@ from typing import Any
 
 from alphaevolve.errors import ConfigError
 from alphaevolve.models import (
-    ArchiveConfig,
+    CheckpointConfig,
     ControllerConfig,
+    DatabaseConfig,
+    EvaluatorArtifactsConfig,
+    EvaluatorConfig,
+    EvaluatorFeedbackConfig,
+    EvaluatorStageConfig,
     ExperimentConfig,
+    FeatureAxisConfig,
+    MigrationConfig,
     ModelConfig,
+    NoveltyConfig,
     PromptBudget,
+    RetentionConfig,
     SandboxConfig,
 )
 
@@ -24,26 +33,62 @@ def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
     return value
 
 
-def _as_int_tuple(raw: Any, field_name: str) -> tuple[int, ...]:
+def _as_float_tuple(raw: Any, field_name: str) -> tuple[float, ...]:
     if raw is None:
         return ()
     if not isinstance(raw, list) or not raw:
-        raise ConfigError(f"Expected non-empty integer list for {field_name}.")
+        raise ConfigError(f"Expected non-empty numeric list for {field_name}.")
     try:
-        values = tuple(int(item) for item in raw)
+        values = tuple(float(item) for item in raw)
     except (TypeError, ValueError) as exc:
-        raise ConfigError(f"Invalid integer value in {field_name}.") from exc
+        raise ConfigError(f"Invalid numeric value in {field_name}.") from exc
     if values != tuple(sorted(values)):
         raise ConfigError(f"{field_name} must be sorted in ascending order.")
     return values
 
 
-def _as_str_tuple(raw: Any) -> tuple[str, ...]:
+def _resolve_path(base_dir: Path, raw: Any, field_name: str) -> Path:
     if raw is None:
-        return ()
-    if not isinstance(raw, list):
-        raise ConfigError("scripted_responses must be a list of strings.")
-    return tuple(str(item) for item in raw)
+        raise ConfigError(f"Missing required path for {field_name}.")
+    path = (base_dir / str(raw)).resolve()
+    return path
+
+
+def _reject_fake(section_name: str, field_name: str, value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized == "fake":
+        raise ConfigError(f"{section_name}.{field_name}='fake' is no longer supported.")
+    return value
+
+
+def _load_feature_axes(raw_axes: Any) -> tuple[FeatureAxisConfig, ...]:
+    if raw_axes is None:
+        return DatabaseConfig().feature_axes
+    if not isinstance(raw_axes, list) or not raw_axes:
+        raise ConfigError("database.feature_axes must be a non-empty list of tables.")
+    axes: list[FeatureAxisConfig] = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(raw_axes, start=1):
+        if not isinstance(item, dict):
+            raise ConfigError(f"database.feature_axes[{index}] must be a table.")
+        try:
+            name = str(item["name"])
+            source = str(item["source"])
+        except KeyError as exc:
+            raise ConfigError(
+                f"database.feature_axes[{index}] is missing required key {exc.args[0]!r}."
+            ) from exc
+        if name in seen_names:
+            raise ConfigError(f"database.feature_axes uses duplicate axis name {name!r}.")
+        scale = str(item.get("scale", "identity"))
+        if scale not in {"identity", "log1p"}:
+            raise ConfigError(
+                f"database.feature_axes[{index}].scale must be 'identity' or 'log1p'."
+            )
+        bins = _as_float_tuple(item.get("bins"), f"database.feature_axes[{index}].bins")
+        axes.append(FeatureAxisConfig(name=name, source=source, scale=scale, bins=bins))
+        seen_names.add(name)
+    return tuple(axes)
 
 
 def load_experiment_config(path: str | Path) -> ExperimentConfig:
@@ -70,25 +115,41 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
 
     model_section = _section(raw, "model")
     sandbox_section = _section(raw, "sandbox")
-    archive_section = _section(raw, "archive")
+    database_section = raw.get("database")
+    archive_section = raw.get("archive")
+    if database_section is not None and archive_section is not None:
+        raise ConfigError("Use either [database] or deprecated [archive], not both.")
+    if database_section is None and archive_section is not None:
+        if not isinstance(archive_section, dict):
+            raise ConfigError("Expected table [archive] in config.")
+        database_section = archive_section
+    if database_section is None:
+        database_section = {}
+    if not isinstance(database_section, dict):
+        raise ConfigError("Expected table [database] in config.")
+    evaluator_section = _section(raw, "evaluator")
+    checkpoint_section = _section(raw, "checkpoint")
     controller_section = _section(raw, "controller")
 
     prompt_budget = PromptBudget(
         max_prompt_tokens=int(model_section.get("max_prompt_tokens", 12_000)),
         reserved_completion_tokens=int(model_section.get("reserved_completion_tokens", 2_048)),
         max_history_programs=int(model_section.get("max_history_programs", 4)),
+        max_artifact_context=int(model_section.get("max_artifact_context", 3)),
     )
+    provider = _reject_fake("model", "provider", str(model_section.get("provider", "ollama")))
     model = ModelConfig(
-        provider=str(model_section.get("provider", "fake")),
+        provider=provider,
         model=str(model_section.get("model", "gemma4:26b")),
         base_url=str(model_section.get("base_url", "http://localhost:11434")),
         request_timeout_seconds=float(model_section.get("request_timeout_seconds", 120.0)),
         temperature=float(model_section.get("temperature", 0.2)),
         prompt_budget=prompt_budget,
-        scripted_responses=_as_str_tuple(model_section.get("scripted_responses")),
     )
+
+    backend = _reject_fake("sandbox", "backend", str(sandbox_section.get("backend", "python")))
     sandbox = SandboxConfig(
-        backend=str(sandbox_section.get("backend", "fake")),
+        backend=backend,
         image=str(sandbox_section.get("image", "python:3.12-slim")),
         runtime=str(sandbox_section.get("runtime", "runsc")),
         network_mode=str(sandbox_section.get("network_mode", "none")),
@@ -100,27 +161,85 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         timeout_seconds=float(sandbox_section.get("timeout_seconds", 10.0)),
         working_dir=str(sandbox_section.get("working_dir", "/workspace")),
     )
-    archive = ArchiveConfig(
-        code_length_buckets=_as_int_tuple(
-            archive_section.get("code_length_buckets", [0, 512, 1_024, 2_048, 4_096, 8_192, 16_384]),
-            "archive.code_length_buckets",
+
+    migration_section = _section(database_section, "migration")
+    novelty_section = _section(database_section, "novelty")
+    retention_section = _section(database_section, "retention")
+    database = DatabaseConfig(
+        islands=int(database_section.get("islands", 3)),
+        feature_axes=_load_feature_axes(database_section.get("feature_axes")),
+        migration=MigrationConfig(
+            enabled=bool(migration_section.get("enabled", True)),
+            interval_generations=int(migration_section.get("interval_generations", 5)),
+            strategy=str(migration_section.get("strategy", "best")),
         ),
-        eval_time_buckets_ms=_as_int_tuple(
-            archive_section.get("eval_time_buckets_ms", [0, 10, 50, 100, 250, 500, 1_000, 5_000, 10_000]),
-            "archive.eval_time_buckets_ms",
+        novelty=NoveltyConfig(
+            enabled=bool(novelty_section.get("enabled", True)),
+            exact_dedupe=bool(novelty_section.get("exact_dedupe", True)),
+            similarity_threshold=float(novelty_section.get("similarity_threshold", 0.999)),
+            recent_program_window=int(novelty_section.get("recent_program_window", 20)),
         ),
-        hall_of_fame_size=int(archive_section.get("hall_of_fame_size", 20)),
-        recent_per_cell=int(archive_section.get("recent_per_cell", 5)),
+        retention=RetentionConfig(
+            hall_of_fame_size=int(retention_section.get("hall_of_fame_size", 20)),
+            recent_per_cell=int(retention_section.get("recent_per_cell", 5)),
+            recent_success_window=int(retention_section.get("recent_success_window", 12)),
+            sample_elite_weight=float(retention_section.get("sample_elite_weight", 0.55)),
+            sample_recent_weight=float(retention_section.get("sample_recent_weight", 0.25)),
+            sample_hall_of_fame_weight=float(
+                retention_section.get("sample_hall_of_fame_weight", 0.20)
+            ),
+        ),
     )
+
+    stages_section = _section(evaluator_section, "stages")
+    feedback_section = _section(evaluator_section, "feedback")
+    artifacts_section = _section(evaluator_section, "artifacts")
+    evaluator_module = _resolve_path(
+        config_path.parent,
+        evaluator_section.get("module"),
+        "evaluator.module",
+    )
+    if not evaluator_module.exists():
+        raise ConfigError(f"Evaluator module does not exist: {evaluator_module}")
+    evaluator = EvaluatorConfig(
+        module=evaluator_module,
+        stages=EvaluatorStageConfig(
+            enabled=bool(stages_section.get("enabled", True)),
+            max_stages=int(stages_section.get("max_stages", 3)),
+        ),
+        feedback=EvaluatorFeedbackConfig(
+            enabled=bool(feedback_section.get("enabled", False)),
+            on_success=bool(feedback_section.get("on_success", False)),
+            on_failure=bool(feedback_section.get("on_failure", True)),
+            borderline_score_threshold=float(feedback_section["borderline_score_threshold"])
+            if feedback_section.get("borderline_score_threshold") is not None
+            else None,
+            max_feedback_chars=int(feedback_section.get("max_feedback_chars", 600)),
+        ),
+        artifacts=EvaluatorArtifactsConfig(
+            enabled=bool(artifacts_section.get("enabled", True)),
+            max_inline_bytes=int(artifacts_section.get("max_inline_bytes", 4_096)),
+        ),
+    )
+
+    resume_from = checkpoint_section.get("resume_from")
+    checkpoint = CheckpointConfig(
+        enabled=bool(checkpoint_section.get("enabled", True)),
+        interval_generations=int(checkpoint_section.get("interval_generations", 5)),
+        resume_from=_resolve_path(config_path.parent, resume_from, "checkpoint.resume_from")
+        if resume_from is not None
+        else None,
+    )
+
     controller = ControllerConfig(
-        llm_concurrency=int(controller_section.get("llm_concurrency", 2)),
-        evaluation_concurrency=int(controller_section.get("evaluation_concurrency", 2)),
         max_generations=int(controller_section.get("max_generations", 12)),
-        max_pending_prompts=int(controller_section.get("max_pending_prompts", 4)),
-        max_pending_evaluations=int(controller_section.get("max_pending_evaluations", 4)),
         max_retries=int(controller_section.get("max_retries", 3)),
         metrics_interval_seconds=float(controller_section.get("metrics_interval_seconds", 5.0)),
+        stagnation_patience=int(controller_section.get("stagnation_patience", 8)),
+        max_inflight=int(controller_section.get("max_inflight", 1)),
     )
+    if controller.max_inflight != 1:
+        raise ConfigError("controller.max_inflight must be 1 for the current serial-first engine.")
 
     return ExperimentConfig(
         name=name,
@@ -133,6 +252,8 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         target_score=float(raw.get("target_score", 275.0)),
         model=model,
         sandbox=sandbox,
-        archive=archive,
+        database=database,
+        evaluator=evaluator,
+        checkpoint=checkpoint,
         controller=controller,
     )
