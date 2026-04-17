@@ -95,3 +95,15 @@ max_inflight = 1
 
     with pytest.raises(ConfigError):
         load_experiment_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    sorted((Path(__file__).resolve().parents[1] / "experiments").glob("*.toml")),
+)
+def test_repo_experiment_configs_load(config_path: Path) -> None:
+    config = load_experiment_config(config_path)
+
+    assert config.name
+    assert config.seed_program_path.exists()
+    assert config.evaluator.module.exists()

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from alphaevolve.archive import ProgramDatabase
+from alphaevolve.errors import ConfigError
 from alphaevolve.config import load_experiment_config
 from alphaevolve.controller import EvolutionController
 from alphaevolve.evaluators import build_evaluator, docker_environment_status
@@ -40,6 +41,18 @@ def build_parser() -> argparse.ArgumentParser:
     docker_parser = subparsers.add_parser("smoke-docker", help="Smoke-test the Docker/gVisor runtime.")
     docker_parser.add_argument("--config", required=True, help="Path to an experiment TOML file.")
 
+    clone_parser = subparsers.add_parser(
+        "clone-best",
+        help="Clone an experiment directory and replace the cloned seed with the run's best program.",
+    )
+    clone_parser.add_argument("--config", required=True, help="Path to the original experiment TOML file.")
+    clone_parser.add_argument("--run", required=True, help="Path to a previous run directory.")
+    clone_parser.add_argument(
+        "--output",
+        required=True,
+        help="Destination directory for the cloned experiment bundle.",
+    )
+
     return parser
 
 
@@ -54,6 +67,12 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_smoke_ollama(Path(args.config)))
     if args.command == "smoke-docker":
         return asyncio.run(_smoke_docker(Path(args.config)))
+    if args.command == "clone-best":
+        return _clone_best_command(
+            config_path=Path(args.config),
+            run_dir=Path(args.run),
+            output_dir=Path(args.output),
+        )
     parser.error(f"Unsupported command: {args.command}")
     return 2
 
@@ -128,6 +147,58 @@ async def _run_controller(config, *, run_dir: Path, logger: logging.Logger):
     return await controller.run(Program.seed(seed_code))
 
 
+def _clone_best_command(*, config_path: Path, run_dir: Path, output_dir: Path) -> int:
+    logger = logging.getLogger("alphaevolve.cli")
+    try:
+        config = load_experiment_config(config_path)
+    except ConfigError as exc:
+        logger.error("Failed to load experiment config %s: %s", config_path, exc)
+        return 2
+
+    resolved_run_dir = run_dir.expanduser().resolve()
+    database_dir = resolved_run_dir / "database"
+    if not database_dir.exists():
+        logger.error("Run directory does not contain a database: %s", resolved_run_dir)
+        return 2
+
+    database = ProgramDatabase(config.database, database_dir)
+    best_program = database.best_program()
+    if best_program is None:
+        logger.error("Run directory does not contain a best program: %s", resolved_run_dir)
+        return 2
+
+    source_dir = config_path.expanduser().resolve().parent
+    resolved_output_dir = output_dir.expanduser().resolve()
+    if resolved_output_dir == source_dir or source_dir in resolved_output_dir.parents:
+        logger.error("Output directory must not be inside the source experiment directory: %s", resolved_output_dir)
+        return 2
+    if resolved_output_dir.exists():
+        shutil.rmtree(resolved_output_dir)
+
+    shutil.copytree(
+        source_dir,
+        resolved_output_dir,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    cloned_seed_path = resolved_output_dir / config.seed_program_path.relative_to(source_dir)
+    cloned_seed_path.parent.mkdir(parents=True, exist_ok=True)
+    cloned_seed_path.write_text(best_program.code, encoding="utf-8")
+
+    logger.info(
+        "cloned_best_program run_dir=%s best_program=%s best_score=%.3f clone_dir=%s seed_path=%s",
+        resolved_run_dir,
+        best_program.id,
+        best_program.primary_score,
+        resolved_output_dir,
+        cloned_seed_path,
+    )
+    return 0
+
+
 def _create_run_dir(output_dir: Path, *, stem: str) -> Path:
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     return output_dir.expanduser().resolve() / f"{timestamp}-{stem}"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

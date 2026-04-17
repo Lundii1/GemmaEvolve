@@ -1,20 +1,20 @@
-name = "knapsack"
-description = "Deterministic hello-world benchmark for the AlphaEvolve pipeline."
-seed_program = "knapsack_seed.py"
+name = "budgeted_coverage"
+description = "Budgeted maximum-coverage across multiple deterministic project portfolios."
+seed_program = "budgeted_coverage_seed.py"
 primary_metric = "score"
-target_score = 275.0
+target_score = 343.0
 system_instructions = """
 Act as an expert Python optimization engineer.
 Improve the provided program by proposing small, coherent code changes.
 Use SEARCH/REPLACE diff blocks only and aim to increase the evaluation score.
 """
 task_description = """
-The benchmark is a simple knapsack heuristic.
-Optimize the ordering heuristic while keeping the Python module executable.
+Choose projects under a budget to maximize covered element value across several fixed portfolios.
+The baseline uses a static value-per-cost rule; stronger solutions should reason about overlap and marginal gain.
 """
 evaluation_contract = """
 The program exposes evaluate() and should maximize the returned score.
-The current benchmark reaches the global optimum when score == 275.0.
+The exact optimum score across all portfolios is 343.0.
 """
 
 [model]
@@ -48,7 +48,7 @@ islands = 3
 name = "code_bytes"
 source = "code_bytes"
 scale = "log1p"
-bins = [0.0, 4.2, 4.8, 5.3, 5.8, 6.4, 7.0, 8.0]
+bins = [0.0, 4.4, 5.0, 5.6, 6.2, 6.8, 7.4, 8.0]
 
 [[database.feature_axes]]
 name = "duration_ms"
@@ -58,25 +58,25 @@ bins = [0.0, 0.5, 1.0, 1.8, 2.5, 3.5, 4.6, 6.2, 8.6]
 
 [database.migration]
 enabled = true
-interval_generations = 6
+interval_generations = 8
 strategy = "best"
 
 [database.novelty]
 enabled = true
 exact_dedupe = true
 similarity_threshold = 0.999
-recent_program_window = 20
+recent_program_window = 30
 
 [database.retention]
-hall_of_fame_size = 20
-recent_per_cell = 5
-recent_success_window = 12
-sample_elite_weight = 0.55
-sample_recent_weight = 0.25
+hall_of_fame_size = 24
+recent_per_cell = 6
+recent_success_window = 16
+sample_elite_weight = 0.50
+sample_recent_weight = 0.30
 sample_hall_of_fame_weight = 0.20
 
 [evaluator]
-module = "knapsack_evaluator.py"
+module = "score_evaluator.py"
 
 [evaluator.stages]
 enabled = true
@@ -97,8 +97,8 @@ enabled = true
 interval_generations = 5
 
 [controller]
-max_generations = 24
+max_generations = 48
 max_retries = 3
 metrics_interval_seconds = 5.0
-stagnation_patience = 8
+stagnation_patience = 16
 max_inflight = 1
