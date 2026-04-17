@@ -149,10 +149,11 @@ async def _run_controller(config, *, run_dir: Path, logger: logging.Logger):
 
 def _clone_best_command(*, config_path: Path, run_dir: Path, output_dir: Path) -> int:
     logger = logging.getLogger("alphaevolve.cli")
+    resolved_config_path = config_path.expanduser().resolve()
     try:
-        config = load_experiment_config(config_path)
+        config = load_experiment_config(resolved_config_path)
     except ConfigError as exc:
-        logger.error("Failed to load experiment config %s: %s", config_path, exc)
+        logger.error("Failed to load experiment config %s: %s", resolved_config_path, exc)
         return 2
 
     resolved_run_dir = run_dir.expanduser().resolve()
@@ -167,29 +168,38 @@ def _clone_best_command(*, config_path: Path, run_dir: Path, output_dir: Path) -
         logger.error("Run directory does not contain a best program: %s", resolved_run_dir)
         return 2
 
-    source_dir = config_path.expanduser().resolve().parent
+    source_dir = resolved_config_path.parent
     resolved_output_dir = output_dir.expanduser().resolve()
     if resolved_output_dir == source_dir or source_dir in resolved_output_dir.parents:
         logger.error("Output directory must not be inside the source experiment directory: %s", resolved_output_dir)
         return 2
     if resolved_output_dir.exists():
         shutil.rmtree(resolved_output_dir)
+    resolved_output_dir.mkdir(parents=True, exist_ok=True)
 
-    shutil.copytree(
-        source_dir,
-        resolved_output_dir,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    files_to_copy = (
+        resolved_config_path,
+        config.seed_program_path,
+        config.evaluator.module,
     )
+    for source_file in files_to_copy:
+        relative_path = source_file.relative_to(source_dir)
+        destination = resolved_output_dir / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, destination)
+
+    cloned_config_path = resolved_output_dir / resolved_config_path.name
     cloned_seed_path = resolved_output_dir / config.seed_program_path.relative_to(source_dir)
     cloned_seed_path.parent.mkdir(parents=True, exist_ok=True)
     cloned_seed_path.write_text(best_program.code, encoding="utf-8")
 
     logger.info(
-        "cloned_best_program run_dir=%s best_program=%s best_score=%.3f clone_dir=%s seed_path=%s",
+        "cloned_best_program run_dir=%s best_program=%s best_score=%.3f clone_dir=%s config_path=%s seed_path=%s",
         resolved_run_dir,
         best_program.id,
         best_program.primary_score,
         resolved_output_dir,
+        cloned_config_path,
         cloned_seed_path,
     )
     return 0

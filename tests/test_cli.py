@@ -84,7 +84,7 @@ max_inflight = 1
     assert exit_code == 0
     assert (clone_dir / "demo.toml").exists()
     assert (clone_dir / "eval.py").read_text(encoding="utf-8") == evaluator_path.read_text(encoding="utf-8")
-    assert (clone_dir / "notes.txt").read_text(encoding="utf-8") == "keep me\n"
+    assert not (clone_dir / "notes.txt").exists()
     assert (clone_dir / "seed.py").read_text(encoding="utf-8") == best_program.code
     assert seed_path.read_text(encoding="utf-8") == "def evaluate():\n    return {'score': 1.0}\n"
 

@@ -71,6 +71,7 @@ There are also harder deterministic benchmarks you can try:
 - [experiments/knapsack_portfolio.toml](/C:/Users/amine/OneDrive/Desktop/GemmaEvolve/experiments/knapsack_portfolio.toml) for multi-instance 0/1 knapsack with an exact target of `1860`
 - [experiments/weighted_tardiness.toml](/C:/Users/amine/OneDrive/Desktop/GemmaEvolve/experiments/weighted_tardiness.toml) for single-machine weighted tardiness scheduling with an exact target of `3413`
 - [experiments/budgeted_coverage.toml](/C:/Users/amine/OneDrive/Desktop/GemmaEvolve/experiments/budgeted_coverage.toml) for budgeted maximum coverage with an exact target of `343`
+- [experiments/turan_tetrahedron.toml](/C:/Users/amine/OneDrive/Desktop/GemmaEvolve/experiments/turan_tetrahedron.toml) for dense `K_4^3`-free 3-uniform hypergraph construction with a reference target of `5502`
 
 Run a fresh experiment:
 
