@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import bisect
 import json
 import math
+import os
 import random
 from collections import deque
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from alphaevolve.models import (
     ArtifactRecord,
@@ -20,6 +22,14 @@ from alphaevolve.models import (
     decode_random_state,
     encode_random_state,
 )
+
+SIGNATURE_RATIO_FEATURES = (
+    "signature_111_ratio",
+    "signature_210_ratio",
+    "signature_300_ratio",
+)
+_LANE_ORDER = ("elite", "recent", "hall_of_fame")
+_RELAXATION_ORDER = ("STRICT", "NO_SHARE_CAP", "NO_COOLDOWN")
 
 
 @dataclass(slots=True)
@@ -113,6 +123,7 @@ class ProgramDatabase:
         self._hall_of_fame: list[str] = []
         self._best_program_id: str | None = None
         self._accepted_code_hashes: dict[str, str] = {}
+        self._accepted_behavior_fingerprints: dict[str, str] = {}
         self._recent_code_ids: dict[int, deque[str]] = {
             island_id: deque(maxlen=config.novelty.recent_program_window)
             for island_id in range(config.islands)
@@ -125,7 +136,14 @@ class ProgramDatabase:
             for island_id in range(config.islands)
         }
         self._migration_events = 0
+        self._parent_sample_counter = 0
+        self._recent_parent_ids: deque[str] = deque(
+            maxlen=config.retention.parent_share_window
+        )
+        self._parent_mutation_failure_streaks: dict[str, int] = {}
+        self._parent_penalty_until_sample: dict[str, int] = {}
         self._random = random_source or random.Random()
+        self._lock = asyncio.Lock()
         self._root_dir.mkdir(parents=True, exist_ok=True)
         self._programs_dir.mkdir(parents=True, exist_ok=True)
         self._prompts_dir.mkdir(parents=True, exist_ok=True)
@@ -139,12 +157,18 @@ class ProgramDatabase:
 
     def save(self) -> None:
         """Persist metadata and lightweight indexes to disk."""
+        self._prune_parent_tracking_unlocked()
         payload = {
-            "version": 1,
+            "version": 2,
             "best_program_id": self._best_program_id,
             "hall_of_fame": self._hall_of_fame,
             "accepted_code_hashes": self._accepted_code_hashes,
+            "accepted_behavior_fingerprints": self._accepted_behavior_fingerprints,
             "migration_events": self._migration_events,
+            "parent_sample_counter": self._parent_sample_counter,
+            "recent_parent_ids": list(self._recent_parent_ids),
+            "parent_mutation_failure_streaks": self._parent_mutation_failure_streaks,
+            "parent_penalty_until_sample": self._parent_penalty_until_sample,
             "database_random_state": encode_random_state(self._random.getstate()),
             "program_ids": sorted(self._programs),
             "prompt_log_ids": sorted(self._prompt_logs),
@@ -157,7 +181,7 @@ class ProgramDatabase:
                 for island_id, state in self._islands.items()
             },
         }
-        self._state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._write_json(self._state_path, payload)
 
     def load(self) -> None:
         """Load persisted database state from disk."""
@@ -186,7 +210,12 @@ class ProgramDatabase:
             str(key): str(value)
             for key, value in dict(payload.get("accepted_code_hashes", {})).items()
         }
+        self._accepted_behavior_fingerprints = {
+            str(key): str(value)
+            for key, value in dict(payload.get("accepted_behavior_fingerprints", {})).items()
+        }
         self._migration_events = int(payload.get("migration_events", 0))
+        self._parent_sample_counter = int(payload.get("parent_sample_counter", 0))
         if payload.get("database_random_state"):
             self._random.setstate(decode_random_state(str(payload["database_random_state"])))
         self._recent_code_ids = {
@@ -207,15 +236,29 @@ class ProgramDatabase:
             )
             for island_id in range(self._config.islands)
         }
+        self._recent_parent_ids = deque(
+            (str(item) for item in payload.get("recent_parent_ids", [])),
+            maxlen=self._config.retention.parent_share_window,
+        )
+        self._parent_mutation_failure_streaks = {
+            str(key): int(value)
+            for key, value in dict(payload.get("parent_mutation_failure_streaks", {})).items()
+        }
+        self._parent_penalty_until_sample = {
+            str(key): int(value)
+            for key, value in dict(payload.get("parent_penalty_until_sample", {})).items()
+        }
+        self._prune_parent_tracking_unlocked()
 
-    def record_prompt_log(self, prompt_log: PromptLog) -> PromptLog:
+    async def record_prompt_log(self, prompt_log: PromptLog) -> PromptLog:
         """Persist a prompt log."""
-        self._prompt_logs[prompt_log.id] = prompt_log
-        self._write_json(self._prompts_dir / f"{prompt_log.id}.json", prompt_log.to_dict())
-        self.save()
-        return prompt_log
+        async with self._lock:
+            self._prompt_logs[prompt_log.id] = prompt_log
+            self._write_json(self._prompts_dir / f"{prompt_log.id}.json", prompt_log.to_dict())
+            self.save()
+            return prompt_log
 
-    def update_prompt_log(
+    async def update_prompt_log(
         self,
         prompt_log_id: str,
         *,
@@ -223,25 +266,26 @@ class ProgramDatabase:
         child_id: str | None = None,
     ) -> PromptLog:
         """Update a previously recorded prompt log."""
-        prompt_log = self._prompt_logs[prompt_log_id]
-        updated = PromptLog(
-            id=prompt_log.id,
-            parent_id=prompt_log.parent_id,
-            island_id=prompt_log.island_id,
-            prompt_text=prompt_log.prompt_text,
-            estimated_tokens=prompt_log.estimated_tokens,
-            included_program_ids=prompt_log.included_program_ids,
-            summarized_program_ids=prompt_log.summarized_program_ids,
-            artifact_context=prompt_log.artifact_context,
-            evaluator_feedback_used=prompt_log.evaluator_feedback_used,
-            model_response=model_response if model_response is not None else prompt_log.model_response,
-            child_id=child_id if child_id is not None else prompt_log.child_id,
-            created_at=prompt_log.created_at,
-        )
-        self._prompt_logs[prompt_log_id] = updated
-        self._write_json(self._prompts_dir / f"{prompt_log_id}.json", updated.to_dict())
-        self.save()
-        return updated
+        async with self._lock:
+            prompt_log = self._prompt_logs[prompt_log_id]
+            updated = PromptLog(
+                id=prompt_log.id,
+                parent_id=prompt_log.parent_id,
+                island_id=prompt_log.island_id,
+                prompt_text=prompt_log.prompt_text,
+                estimated_tokens=prompt_log.estimated_tokens,
+                included_program_ids=prompt_log.included_program_ids,
+                summarized_program_ids=prompt_log.summarized_program_ids,
+                artifact_context=prompt_log.artifact_context,
+                evaluator_feedback_used=prompt_log.evaluator_feedback_used,
+                model_response=model_response if model_response is not None else prompt_log.model_response,
+                child_id=child_id if child_id is not None else prompt_log.child_id,
+                created_at=prompt_log.created_at,
+            )
+            self._prompt_logs[prompt_log_id] = updated
+            self._write_json(self._prompts_dir / f"{prompt_log_id}.json", updated.to_dict())
+            self.save()
+            return updated
 
     def get_prompt_log(self, prompt_log_id: str) -> PromptLog | None:
         return self._prompt_logs.get(prompt_log_id)
@@ -249,25 +293,34 @@ class ProgramDatabase:
     def get_program(self, program_id: str) -> Program | None:
         return self._programs.get(program_id)
 
-    def record_seed_across_islands(self, seed_program: Program) -> Program:
+    async def record_seed_across_islands(self, seed_program: Program) -> Program:
         """Record the seed once and share it across all islands."""
-        seed_program.island_id = 0
-        seed_program.accepted = True
-        seed_program.features = self._raw_feature_values(seed_program)
-        seed_program.archive_cell = self.cell_key_for(seed_program)
-        self._record_program(seed_program)
-        self._accepted_code_hashes[seed_program.code_hash] = seed_program.id
-        self._register_program_in_island(seed_program.id, island_id=0)
-        self._recent_code_ids[0].append(seed_program.id)
-        for island_id in range(1, self._config.islands):
-            self._register_program_in_island(seed_program.id, island_id=island_id)
-            self._recent_code_ids[island_id].append(seed_program.id)
-        self._update_hall_of_fame(seed_program.id)
-        self.save()
-        return seed_program
+        async with self._lock:
+            seed_program.island_id = 0
+            seed_program.accepted = True
+            seed_program.features = self._raw_feature_values(seed_program)
+            seed_program.behavior_fingerprint = self._behavior_fingerprint(seed_program)
+            seed_program.behaviorally_novel = True
+            seed_program.archive_cell = self.cell_key_for(seed_program)
+            self._record_program(seed_program)
+            self._accepted_code_hashes[seed_program.code_hash] = seed_program.id
+            if seed_program.behavior_fingerprint is not None:
+                self._accepted_behavior_fingerprints[seed_program.behavior_fingerprint] = seed_program.id
+            self._register_program_in_island(seed_program.id, island_id=0)
+            self._recent_code_ids[0].append(seed_program.id)
+            for island_id in range(1, self._config.islands):
+                self._register_program_in_island(seed_program.id, island_id=island_id)
+                self._recent_code_ids[island_id].append(seed_program.id)
+            self._update_hall_of_fame(seed_program.id)
+            self.save()
+            return seed_program
 
-    def preflight_candidate(self, program: Program, *, island_id: int) -> str | None:
+    async def preflight_candidate(self, program: Program, *, island_id: int) -> str | None:
         """Return a rejection reason if the candidate is not novel enough."""
+        async with self._lock:
+            return self._preflight_candidate_unlocked(program, island_id=island_id)
+
+    def _preflight_candidate_unlocked(self, program: Program, *, island_id: int) -> str | None:
         if not self._config.novelty.enabled:
             return None
         if self._config.novelty.exact_dedupe and program.code_hash in self._accepted_code_hashes:
@@ -281,77 +334,128 @@ class ProgramDatabase:
                 return "near_duplicate"
         return None
 
-    def record(self, program: Program) -> Program:
+    async def record(self, program: Program) -> Program:
         """Persist a program and, when accepted, update island state."""
-        program.features = self._raw_feature_values(program)
-        program.archive_cell = self.cell_key_for(program)
-        self._record_program(program)
-        if program.accepted:
-            self._accepted_code_hashes[program.code_hash] = program.id
-            self._recent_code_ids[program.island_id].append(program.id)
-            self._register_program_in_island(program.id, island_id=program.island_id)
-            self._update_hall_of_fame(program.id)
-        self.save()
-        return program
-
-    def maybe_migrate(self, *, generation: int, source_island_id: int) -> tuple[int, str] | None:
-        """Migrate an elite across the ring topology when the interval is reached."""
-        migration = self._config.migration
-        if not migration.enabled:
-            return None
-        if generation == 0 or generation % max(migration.interval_generations, 1) != 0:
-            return None
-        source_island = self._islands[source_island_id]
-        candidate_ids = [
-            cell.elite_id
-            for cell in source_island.cells.values()
-            if cell.elite_id is not None and self._programs.get(cell.elite_id) is not None
-        ]
-        if not candidate_ids:
-            return None
-        if migration.strategy == "diverse":
-            program_id = max(
-                candidate_ids,
-                key=lambda item: (
-                    self._diversity_score(self._programs[item].code, source_island_id),
-                    self._programs[item].primary_score,
-                ),
-            )
-        else:
-            program_id = max(candidate_ids, key=lambda item: self._programs[item].primary_score)
-        target_island_id = (source_island_id + 1) % self._config.islands
-        program = self._programs[program_id]
-        if self.preflight_candidate(program, island_id=target_island_id) == "near_duplicate":
-            return None
-        self._register_program_in_island(program_id, island_id=target_island_id)
-        self._migration_events += 1
-        self.save()
-        return target_island_id, program_id
-
-    def sample(self, island_id: int) -> Program:
-        """Sample a parent from a chosen island."""
-        island = self._islands[island_id]
-        lane_names = ["elite", "recent", "hall_of_fame"]
-        lane_weights = [
-            self._config.retention.sample_elite_weight,
-            self._config.retention.sample_recent_weight,
-            self._config.retention.sample_hall_of_fame_weight,
-        ]
-        lane = self._random.choices(lane_names, weights=lane_weights, k=1)[0]
-        program = self._sample_lane(island_id, lane)
-        if program is not None:
+        async with self._lock:
+            program.features = self._raw_feature_values(program)
+            program.behavior_fingerprint = self._behavior_fingerprint(program)
+            program.archive_cell = self.cell_key_for(program)
+            program.behaviorally_novel = False
+            if program.accepted:
+                behavior_rejection = self._behavior_rejection_reason(program)
+                if behavior_rejection is not None:
+                    program.accepted = False
+                    program.rejection_reason = behavior_rejection
+                    if program.evaluation is not None:
+                        program.evaluation = program.evaluation.__class__(
+                            status=program.evaluation.status,
+                            primary_score=program.evaluation.primary_score,
+                            metrics=program.evaluation.metrics,
+                            features=program.evaluation.features,
+                            execution=program.evaluation.execution,
+                            stage_results=program.evaluation.stage_results,
+                            artifacts=program.evaluation.artifacts,
+                            feedback=program.evaluation.feedback,
+                            rejection_reason=behavior_rejection,
+                        )
+            self._record_program(program)
+            if program.accepted:
+                program.behaviorally_novel = self._is_behaviorally_novel(program)
+                self._accepted_code_hashes[program.code_hash] = program.id
+                if program.behavior_fingerprint is not None:
+                    self._accepted_behavior_fingerprints[program.behavior_fingerprint] = program.id
+                self._recent_code_ids[program.island_id].append(program.id)
+                self._register_program_in_island(program.id, island_id=program.island_id)
+                self._update_hall_of_fame(program.id)
+            self.save()
             return program
-        for fallback_lane in lane_names:
-            program = self._sample_lane(island_id, fallback_lane)
-            if program is not None:
-                return program
-        raise ValueError("Cannot sample from an empty database island.")
 
-    def best_program(self) -> Program | None:
+    async def maybe_migrate(self, *, generation: int, source_island_id: int) -> tuple[int, str] | None:
+        """Migrate an elite across the ring topology when the interval is reached."""
+        async with self._lock:
+            migration = self._config.migration
+            if not migration.enabled:
+                return None
+            if generation == 0 or generation % max(migration.interval_generations, 1) != 0:
+                return None
+            source_island = self._islands[source_island_id]
+            candidate_ids = [
+                cell.elite_id
+                for cell in source_island.cells.values()
+                if cell.elite_id is not None and self._programs.get(cell.elite_id) is not None
+            ]
+            if not candidate_ids:
+                return None
+            if migration.strategy == "diverse":
+                program_id = max(
+                    candidate_ids,
+                    key=lambda item: (
+                        self._diversity_score(self._programs[item].code, source_island_id),
+                        self._programs[item].primary_score,
+                    ),
+                )
+            else:
+                program_id = max(candidate_ids, key=lambda item: self._programs[item].primary_score)
+            target_island_id = (source_island_id + 1) % self._config.islands
+            program = self._programs[program_id]
+            if self._preflight_candidate_unlocked(program, island_id=target_island_id) == "near_duplicate":
+                return None
+            self._register_program_in_island(program_id, island_id=target_island_id)
+            self._migration_events += 1
+            self.save()
+            return target_island_id, program_id
+
+    async def sample(self, island_id: int) -> Program:
+        """Sample a parent from a chosen island."""
+        async with self._lock:
+            lane_weights = [
+                self._config.retention.sample_elite_weight,
+                self._config.retention.sample_recent_weight,
+                self._config.retention.sample_hall_of_fame_weight,
+            ]
+            preferred_lane = self._random.choices(_LANE_ORDER, weights=lane_weights, k=1)[0]
+            for relaxation in _RELAXATION_ORDER:
+                for lane in self._lane_attempt_order(preferred_lane):
+                    program = self._sample_lane(
+                        island_id,
+                        lane,
+                        relaxation=relaxation,
+                    )
+                    if program is None:
+                        continue
+                    self._record_parent_sample_unlocked(program.id)
+                    self.save()
+                    return program
+            raise ValueError("Cannot sample from an empty database island.")
+
+    async def record_parent_mutation_outcome(self, parent_id: str, *, success: bool) -> None:
+        """Track whether a parent produced a syntactically valid child."""
+        async with self._lock:
+            if success:
+                self._parent_mutation_failure_streaks.pop(parent_id, None)
+                self._parent_penalty_until_sample.pop(parent_id, None)
+            else:
+                streak = self._parent_mutation_failure_streaks.get(parent_id, 0) + 1
+                threshold = max(self._config.retention.mutation_failure_streak_threshold, 1)
+                if streak >= threshold:
+                    penalty_window = max(self._config.retention.mutation_failure_penalty_samples, 1)
+                    self._parent_penalty_until_sample[parent_id] = (
+                        self._parent_sample_counter + penalty_window
+                    )
+                    self._parent_mutation_failure_streaks.pop(parent_id, None)
+                else:
+                    self._parent_mutation_failure_streaks[parent_id] = streak
+            self.save()
+
+    async def best_program(self) -> Program | None:
         """Return the current best program if present."""
+        async with self._lock:
+            return self._best_program_unlocked()
+
+    def _best_program_unlocked(self) -> Program | None:
         return self._programs.get(self._best_program_id) if self._best_program_id else None
 
-    def promising_programs(
+    async def promising_programs(
         self,
         limit: int,
         *,
@@ -359,27 +463,108 @@ class ProgramDatabase:
         exclude_id: str | None = None,
     ) -> list[Program]:
         """Return high-quality programs suitable for prompt history."""
-        seen: set[str] = set()
-        candidates: list[Program] = []
-        island = self._islands[island_id]
-        for program_id in island.recent_success_ids:
-            if program_id == exclude_id or program_id in seen:
+        async with self._lock:
+            seen: set[str] = set()
+            candidates: list[Program] = []
+            island = self._islands[island_id]
+            for program_id in island.recent_success_ids:
+                if program_id == exclude_id or program_id in seen:
+                    continue
+                program = self._programs.get(program_id)
+                if program is None or not program.accepted:
+                    continue
+                seen.add(program_id)
+                candidates.append(program)
+            for program_id in self._hall_of_fame:
+                if program_id == exclude_id or program_id in seen:
+                    continue
+                program = self._programs.get(program_id)
+                if program is None or not program.accepted:
+                    continue
+                seen.add(program_id)
+                candidates.append(program)
+            if not candidates:
+                return []
+
+            current_program = self._programs.get(exclude_id) if exclude_id is not None else None
+            ranked = sorted(candidates, key=lambda item: item.primary_score, reverse=True)
+            selected: list[Program] = []
+            selected_ids: set[str] = set()
+
+            best = ranked[0]
+            selected.append(best)
+            selected_ids.add(best.id)
+
+            for feature_name in SIGNATURE_RATIO_FEATURES:
+                if len(selected) >= limit:
+                    break
+                specialist = self._feature_specialist(ranked, feature_name)
+                if specialist is None or specialist.id in selected_ids:
+                    continue
+                selected.append(specialist)
+                selected_ids.add(specialist.id)
+
+            diverse_reference = current_program or best
+            diverse_candidates = [
+                program
+                for program in ranked
+                if program.id not in selected_ids and self._is_behaviorally_distinct(program, diverse_reference)
+            ]
+            if diverse_candidates:
+                diverse = max(
+                    diverse_candidates,
+                    key=lambda item: (self._behavior_distance(item, diverse_reference), item.primary_score),
+                )
+                selected.append(diverse)
+                selected_ids.add(diverse.id)
+
+            for program_id in reversed(island.recent_success_ids):
+                if len(selected) >= limit:
+                    break
+                if program_id == exclude_id or program_id in selected_ids:
+                    continue
+                program = self._programs.get(program_id)
+                if program is None or not program.accepted or not program.behaviorally_novel:
+                    continue
+                selected.append(program)
+                selected_ids.add(program.id)
+                break
+
+            for program in ranked:
+                if len(selected) >= limit:
+                    break
+                if program.id in selected_ids:
+                    continue
+                if any(self._same_behavior(program, prior) for prior in selected):
+                    continue
+                selected.append(program)
+                selected_ids.add(program.id)
+
+            for program in ranked:
+                if len(selected) >= limit:
+                    break
+                if program.id in selected_ids:
+                    continue
+                selected.append(program)
+                selected_ids.add(program.id)
+            return selected[:limit]
+
+    def _feature_specialist(
+        self,
+        candidates: Sequence[Program],
+        feature_name: str,
+    ) -> Program | None:
+        specialist: Program | None = None
+        best_key: tuple[float, float] | None = None
+        for program in candidates:
+            feature_value = float(program.features.get(feature_name, 0.0))
+            if feature_value <= 0.0:
                 continue
-            program = self._programs.get(program_id)
-            if program is None or not program.accepted:
-                continue
-            seen.add(program_id)
-            candidates.append(program)
-        for program_id in self._hall_of_fame:
-            if program_id == exclude_id or program_id in seen:
-                continue
-            program = self._programs.get(program_id)
-            if program is None or not program.accepted:
-                continue
-            seen.add(program_id)
-            candidates.append(program)
-        ranked = sorted(candidates, key=lambda item: item.primary_score, reverse=True)
-        return ranked[:limit]
+            key = (feature_value, program.primary_score)
+            if best_key is None or key > best_key:
+                specialist = program
+                best_key = key
+        return specialist
 
     def cell_key_for(self, program: Program) -> tuple[int, ...]:
         """Compute the MAP-Elites bin for a program using configured feature axes."""
@@ -393,7 +578,7 @@ class ProgramDatabase:
 
     def stats(self) -> dict[str, int | float]:
         """Return basic database statistics for logging."""
-        best = self.best_program()
+        best = self._best_program_unlocked()
         populated_cells = sum(len(island.cells) for island in self._islands.values())
         return {
             "programs": len(self._programs),
@@ -417,37 +602,109 @@ class ProgramDatabase:
     def list_prompt_logs(self) -> list[PromptLog]:
         return list(self._prompt_logs.values())
 
-    def _sample_lane(self, island_id: int, lane: str) -> Program | None:
+    def _sample_lane(self, island_id: int, lane: str, *, relaxation: str) -> Program | None:
+        candidates = self._lane_candidates(island_id, lane)
+        if not candidates:
+            return None
+        weighted_candidates: list[tuple[Program, float]] = []
+        for program, base_weight in candidates:
+            if self._should_exclude_parent(program.id, relaxation=relaxation):
+                continue
+            weight = base_weight * self._mutation_penalty_weight(program.id)
+            if weight <= 0.0:
+                continue
+            weighted_candidates.append((program, weight))
+        if not weighted_candidates:
+            return None
+        programs = [program for program, _ in weighted_candidates]
+        weights = [weight for _, weight in weighted_candidates]
+        return self._random.choices(programs, weights=weights, k=1)[0]
+
+    def _lane_candidates(self, island_id: int, lane: str) -> list[tuple[Program, float]]:
         island = self._islands[island_id]
         if lane == "elite":
-            elite_ids = [
-                cell.elite_id
-                for cell in island.cells.values()
-                if cell.elite_id is not None and self._programs.get(cell.elite_id) is not None
-            ]
-            if not elite_ids:
-                return None
-            return self._programs[self._random.choice(elite_ids)]
+            seen: set[str] = set()
+            candidates: list[tuple[Program, float]] = []
+            for cell in island.cells.values():
+                if cell.elite_id is None or cell.elite_id in seen:
+                    continue
+                program = self._programs.get(cell.elite_id)
+                if program is None:
+                    continue
+                seen.add(program.id)
+                candidates.append((program, 1.0))
+            return candidates
         if lane == "recent":
-            recent_ids = [
-                program_id
-                for program_id in island.recent_success_ids
-                if self._programs.get(program_id) is not None
-            ]
-            if not recent_ids:
-                return None
-            return self._programs[self._random.choice(recent_ids)]
-        if not self._hall_of_fame:
-            return None
-        weighted_ids = [
-            program_id
-            for program_id in self._hall_of_fame
-            if self._programs.get(program_id) is not None
-        ]
-        if not weighted_ids:
-            return None
-        weights = [max(self._programs[program_id].primary_score, 0.0) + 1.0 for program_id in weighted_ids]
-        return self._programs[self._random.choices(weighted_ids, weights=weights, k=1)[0]]
+            recent_ids: list[str] = []
+            seen: set[str] = set()
+            for program_id in reversed(island.recent_success_ids):
+                if program_id in seen:
+                    continue
+                program = self._programs.get(program_id)
+                if program is None:
+                    continue
+                seen.add(program_id)
+                recent_ids.append(program_id)
+            recent_count = len(recent_ids)
+            candidates = []
+            for index, program_id in enumerate(recent_ids):
+                program = self._programs[program_id]
+                weight = float(recent_count - index)
+                weight /= 1.0 + float(self._recent_parent_frequency(program_id))
+                if program.behaviorally_novel:
+                    weight *= 1.5
+                candidates.append((program, weight))
+            return candidates
+        candidates = []
+        for program_id in self._hall_of_fame:
+            program = self._programs.get(program_id)
+            if program is None:
+                continue
+            candidates.append((program, math.sqrt(max(0.0, program.primary_score) + 1.0)))
+        return candidates
+
+    def _lane_attempt_order(self, preferred_lane: str) -> list[str]:
+        ordered = [preferred_lane]
+        ordered.extend(lane for lane in _LANE_ORDER if lane != preferred_lane)
+        return ordered
+
+    def _should_exclude_parent(self, program_id: str, *, relaxation: str) -> bool:
+        if relaxation == "STRICT" and self._is_share_capped(program_id):
+            return True
+        if relaxation in {"STRICT", "NO_SHARE_CAP"} and self._is_best_parent_on_cooldown(program_id):
+            return True
+        return False
+
+    def _is_share_capped(self, program_id: str) -> bool:
+        if not self._recent_parent_ids:
+            return False
+        frequency = self._recent_parent_frequency(program_id)
+        return (frequency / len(self._recent_parent_ids)) > self._config.retention.parent_share_cap
+
+    def _is_best_parent_on_cooldown(self, program_id: str) -> bool:
+        if program_id != self._best_program_id:
+            return False
+        cooldown_window = self._config.retention.best_parent_cooldown_samples
+        if cooldown_window <= 0:
+            return False
+        recent_ids = list(self._recent_parent_ids)[-cooldown_window:]
+        return program_id in recent_ids
+
+    def _mutation_penalty_weight(self, program_id: str) -> float:
+        expires_at = self._parent_penalty_until_sample.get(program_id)
+        if expires_at is None:
+            return 1.0
+        if expires_at <= self._parent_sample_counter:
+            self._parent_penalty_until_sample.pop(program_id, None)
+            return 1.0
+        return self._config.retention.mutation_failure_weight_multiplier
+
+    def _recent_parent_frequency(self, program_id: str) -> int:
+        return sum(1 for recent_parent_id in self._recent_parent_ids if recent_parent_id == program_id)
+
+    def _record_parent_sample_unlocked(self, program_id: str) -> None:
+        self._recent_parent_ids.append(program_id)
+        self._parent_sample_counter += 1
 
     def _register_program_in_island(self, program_id: str, *, island_id: int) -> None:
         program = self._programs[program_id]
@@ -480,6 +737,26 @@ class ProgramDatabase:
         if self._hall_of_fame:
             self._best_program_id = self._hall_of_fame[0]
 
+    def _prune_parent_tracking_unlocked(self) -> None:
+        reachable_ids = set(self._hall_of_fame)
+        for island in self._islands.values():
+            reachable_ids.update(program_id for program_id in island.recent_success_ids if program_id in self._programs)
+            reachable_ids.update(
+                cell.elite_id
+                for cell in island.cells.values()
+                if cell.elite_id is not None and cell.elite_id in self._programs
+            )
+        self._parent_mutation_failure_streaks = {
+            program_id: streak
+            for program_id, streak in self._parent_mutation_failure_streaks.items()
+            if streak > 0 and program_id in reachable_ids
+        }
+        self._parent_penalty_until_sample = {
+            program_id: expires_at
+            for program_id, expires_at in self._parent_penalty_until_sample.items()
+            if program_id in reachable_ids and expires_at > self._parent_sample_counter
+        }
+
     def _raw_feature_values(self, program: Program) -> dict[str, float]:
         execution_duration_ms = 0.0
         if program.execution is not None:
@@ -502,6 +779,71 @@ class ProgramDatabase:
             return math.log1p(max(value, 0.0))
         return value
 
+    def _behavior_fingerprint(self, program: Program) -> str | None:
+        preferred_metric_items = []
+        for name, value in sorted(program.metrics.items()):
+            if name.startswith("n") and name.endswith("_edges") and name[1:-6].isdigit():
+                preferred_metric_items.append((name, value))
+        for name in ("signature_111_edges", "signature_210_edges", "signature_300_edges"):
+            if name in program.metrics:
+                preferred_metric_items.append((name, program.metrics[name]))
+        if not preferred_metric_items:
+            preferred_metric_items = [
+                (name, value)
+                for name, value in sorted(program.metrics.items())
+                if name != "score"
+            ]
+        if not preferred_metric_items:
+            return None
+        return "|".join(f"{name}={self._format_fingerprint_value(value)}" for name, value in preferred_metric_items)
+
+    def _format_fingerprint_value(self, value: float) -> str:
+        rounded = round(value)
+        if math.isclose(value, rounded):
+            return str(int(rounded))
+        return f"{value:.6f}"
+
+    def _behavior_rejection_reason(self, program: Program) -> str | None:
+        fingerprint = program.behavior_fingerprint
+        if fingerprint is None:
+            return None
+        prior_id = self._accepted_behavior_fingerprints.get(fingerprint)
+        if prior_id is None or prior_id == program.id:
+            return None
+        return "behavior_duplicate"
+
+    def _is_behaviorally_novel(self, program: Program) -> bool:
+        fingerprint = program.behavior_fingerprint
+        if fingerprint is not None and fingerprint not in self._accepted_behavior_fingerprints:
+            return True
+        island = self._islands[program.island_id]
+        return program.archive_cell not in island.cells
+
+    def _same_behavior(self, left: Program, right: Program) -> bool:
+        if left.behavior_fingerprint and right.behavior_fingerprint:
+            return left.behavior_fingerprint == right.behavior_fingerprint
+        if left.archive_cell is not None and right.archive_cell is not None:
+            return left.archive_cell == right.archive_cell
+        return False
+
+    def _is_behaviorally_distinct(self, candidate: Program, reference: Program) -> bool:
+        if candidate.behavior_fingerprint and reference.behavior_fingerprint:
+            if candidate.behavior_fingerprint != reference.behavior_fingerprint:
+                return True
+        if candidate.archive_cell is not None and reference.archive_cell is not None:
+            return candidate.archive_cell != reference.archive_cell
+        return candidate.id != reference.id
+
+    def _behavior_distance(self, candidate: Program, reference: Program) -> float:
+        distance = 0.0
+        if candidate.behavior_fingerprint != reference.behavior_fingerprint:
+            distance += 1.0
+        if candidate.archive_cell is not None and reference.archive_cell is not None:
+            distance += float(
+                sum(abs(candidate_dim - reference_dim) for candidate_dim, reference_dim in zip(candidate.archive_cell, reference.archive_cell))
+            )
+        return distance
+
     def _diversity_score(self, code: str, island_id: int) -> float:
         scores: list[float] = []
         for program_id in self._recent_code_ids[island_id]:
@@ -512,4 +854,6 @@ class ProgramDatabase:
         return sum(scores) / len(scores) if scores else 1.0
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp_path = path.with_name(f"{path.name}.tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp_path, path)

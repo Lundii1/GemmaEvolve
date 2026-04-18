@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,8 @@ from alphaevolve.models import (
     RetentionConfig,
     SandboxConfig,
 )
+
+logger = logging.getLogger("alphaevolve.config")
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -52,6 +55,18 @@ def _resolve_path(base_dir: Path, raw: Any, field_name: str) -> Path:
         raise ConfigError(f"Missing required path for {field_name}.")
     path = (base_dir / str(raw)).resolve()
     return path
+
+
+def _as_command_tuple(raw: Any, field_name: str, *, allow_none: bool = False) -> tuple[str, ...] | None:
+    if raw is None:
+        if allow_none:
+            return None
+        raise ConfigError(f"Missing required command list for {field_name}.")
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError(f"{field_name} must be a non-empty list of strings.")
+    if not all(isinstance(item, str) and item for item in raw):
+        raise ConfigError(f"{field_name} must be a non-empty list of strings.")
+    return tuple(raw)
 
 
 def _reject_fake(section_name: str, field_name: str, value: str) -> str:
@@ -112,6 +127,9 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
 
     if not seed_program_path.exists():
         raise ConfigError(f"Seed program does not exist: {seed_program_path}")
+    mutation_scope = str(raw.get("mutation_scope", "evolve_block"))
+    if mutation_scope not in {"evolve_block", "full_file"}:
+        raise ConfigError("mutation_scope must be 'evolve_block' or 'full_file'.")
 
     model_section = _section(raw, "model")
     sandbox_section = _section(raw, "sandbox")
@@ -142,6 +160,11 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         provider=provider,
         model=str(model_section.get("model", "gemma4:26b")),
         base_url=str(model_section.get("base_url", "http://localhost:11434")),
+        api_key_env=(
+            str(model_section["api_key_env"])
+            if model_section.get("api_key_env") is not None
+            else None
+        ),
         request_timeout_seconds=float(model_section.get("request_timeout_seconds", 120.0)),
         temperature=float(model_section.get("temperature", 0.2)),
         prompt_budget=prompt_budget,
@@ -160,7 +183,19 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         cpu_quota=int(sandbox_section.get("cpu_quota", 50_000)),
         timeout_seconds=float(sandbox_section.get("timeout_seconds", 10.0)),
         working_dir=str(sandbox_section.get("working_dir", "/workspace")),
+        program_filename=str(sandbox_section.get("program_filename", "program.py")),
+        build_command=_as_command_tuple(
+            sandbox_section.get("build_command"),
+            "sandbox.build_command",
+            allow_none=True,
+        ),
+        run_command=_as_command_tuple(
+            sandbox_section.get("run_command", ["python", "{program}"]),
+            "sandbox.run_command",
+        ),
     )
+    if not sandbox.program_filename.strip():
+        raise ConfigError("sandbox.program_filename must not be empty.")
 
     migration_section = _section(database_section, "migration")
     novelty_section = _section(database_section, "novelty")
@@ -187,6 +222,20 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
             sample_recent_weight=float(retention_section.get("sample_recent_weight", 0.25)),
             sample_hall_of_fame_weight=float(
                 retention_section.get("sample_hall_of_fame_weight", 0.20)
+            ),
+            parent_share_window=int(retention_section.get("parent_share_window", 64)),
+            parent_share_cap=float(retention_section.get("parent_share_cap", 0.35)),
+            best_parent_cooldown_samples=int(
+                retention_section.get("best_parent_cooldown_samples", 8)
+            ),
+            mutation_failure_streak_threshold=int(
+                retention_section.get("mutation_failure_streak_threshold", 3)
+            ),
+            mutation_failure_penalty_samples=int(
+                retention_section.get("mutation_failure_penalty_samples", 12)
+            ),
+            mutation_failure_weight_multiplier=float(
+                retention_section.get("mutation_failure_weight_multiplier", 0.20)
             ),
         ),
     )
@@ -238,8 +287,11 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         stagnation_patience=int(controller_section.get("stagnation_patience", 8)),
         max_inflight=int(controller_section.get("max_inflight", 1)),
     )
-    if controller.max_inflight != 1:
-        raise ConfigError("controller.max_inflight must be 1 for the current serial-first engine.")
+    if controller.max_inflight > 32:
+        logger.warning(
+            "controller.max_inflight=%s is unusually high; Docker and the model endpoint may bottleneck above 32 concurrent jobs.",
+            controller.max_inflight,
+        )
 
     return ExperimentConfig(
         name=name,
@@ -250,6 +302,7 @@ def load_experiment_config(path: str | Path) -> ExperimentConfig:
         evaluation_contract=evaluation_contract,
         primary_metric=str(raw.get("primary_metric", "score")),
         target_score=float(raw.get("target_score", 275.0)),
+        mutation_scope=mutation_scope,
         model=model,
         sandbox=sandbox,
         database=database,

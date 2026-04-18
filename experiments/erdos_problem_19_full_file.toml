@@ -1,0 +1,137 @@
+name = "erdos_problem_19_full_file"
+description = "Finite counterexample search for the Erdos-Faber-Lovasz conjecture on small n by evolving the full program that constructs exact edge-disjoint unions of n copies of K_n."
+seed_program = "erdos_problem_19_seed.py"
+primary_metric = "score"
+target_score = 1000.0
+mutation_scope = "full_file"
+system_instructions = """
+Act as an expert Python graph-theory and exact-search engineer.
+Improve the provided program by proposing coherent, high-leverage code changes.
+Return raw SEARCH/REPLACE diff blocks only.
+Your response must begin with <<<<<<< SEARCH and end with >>>>>>> REPLACE.
+Do not include any prose, explanations, markdown fences, comments outside the patch, or text before, between, or after diff blocks.
+"""
+task_description = """
+The benchmark encodes finite instances of Erdos Problem #19 (the Erdos-Faber-Lovasz conjecture).
+For each case n, the program must construct a graph that is an edge-disjoint union of exactly n copies of K_n.
+The exact verifier checks structural validity and whether the resulting graph is n-colorable.
+Any valid case that is not n-colorable is a counterexample and earns a decisive 1000-point bonus, so discovering one verified counterexample should be treated as the primary objective.
+
+The current seed only constructs overlap-rich valid instances; it does not yet search aggressively for non-n-colorable ones.
+To improve it, prefer global construction policies and stronger exact finite search over local greedy edits.
+Useful directions include bounded backtracking, branch-and-bound, constraint-guided construction, better overlap-block design, and exact search focused on creating hard colorability instances.
+Exploit the specific structure of edge-disjoint unions of K_n rather than adding generic optimization machinery unless it clearly helps.
+
+You have full-file mutation rights.
+You may replace the initial heuristic entirely, add new helpers, rewrite data structures, or strengthen the exact search logic.
+Prefer one coherent algorithmic change at a time, and keep the program evaluation-efficient enough to be useful inside repeated search.
+"""
+evaluation_contract = """
+The program must expose evaluate() and should maximize the returned score.
+For each benchmark case n, a candidate design is valid only if it encodes an edge-disjoint union of exactly n copies of K_n.
+The verifier treats a case as a counterexample precisely when the resulting graph is not n-colorable.
+The primary metric is the total score across cases, where any counterexample dominates the overlap-based secondary objective.
+The configured stop target is 1000.0, meaning that discovering even one verified counterexample should end the run immediately.
+"""
+
+[model]
+provider = "longcat"
+model = "LongCat-Flash-Lite"
+base_url = "https://api.longcat.chat/openai"
+api_key_env = "LONGCAT_API_KEY"
+request_timeout_seconds = 180.0
+temperature = 0.4
+max_prompt_tokens = 20000
+reserved_completion_tokens = 4096
+max_history_programs = 6
+max_artifact_context = 4
+
+[sandbox]
+backend = "docker"
+image = "python:3.12-bookworm"
+runtime = "runc"
+network_mode = "none"
+read_only_root = true
+tmpfs_path = "/tmp/eval"
+tmpfs_size_bytes = 33554432
+mem_limit = "1g"
+cpu_quota = 100000
+timeout_seconds = 120.0
+working_dir = "/workspace"
+program_filename = "program.py"
+run_command = ["python", "{program}"]
+
+[database]
+islands = 3
+
+[[database.feature_axes]]
+name = "overlap_ratio"
+source = "overlap_ratio"
+scale = "identity"
+bins = [0.0, 0.08, 0.16, 0.28, 0.40, 0.55, 0.70, 0.85, 1.01]
+
+[[database.feature_axes]]
+name = "compression_ratio"
+source = "compression_ratio"
+scale = "identity"
+bins = [0.0, 0.03, 0.07, 0.12, 0.18, 0.25, 0.33, 0.42, 0.50]
+
+[[database.feature_axes]]
+name = "max_block_ratio"
+source = "max_block_ratio"
+scale = "identity"
+bins = [0.0, 0.17, 0.25, 0.33, 0.42, 0.50, 0.67, 0.84, 1.01]
+
+[database.migration]
+enabled = true
+interval_generations = 10
+strategy = "best"
+
+[database.novelty]
+enabled = true
+exact_dedupe = true
+similarity_threshold = 0.999
+recent_program_window = 40
+
+[database.retention]
+hall_of_fame_size = 36
+recent_per_cell = 8
+recent_success_window = 24
+sample_elite_weight = 0.40
+sample_recent_weight = 0.35
+sample_hall_of_fame_weight = 0.25
+parent_share_window = 64
+parent_share_cap = 0.35
+best_parent_cooldown_samples = 8
+mutation_failure_streak_threshold = 3
+mutation_failure_penalty_samples = 12
+mutation_failure_weight_multiplier = 0.20
+
+[evaluator]
+module = "erdos_problem_19_evaluator.py"
+
+[evaluator.stages]
+enabled = true
+max_stages = 2
+
+[evaluator.feedback]
+enabled = true
+on_success = false
+on_failure = true
+borderline_score_threshold = 140.0
+max_feedback_chars = 800
+
+[evaluator.artifacts]
+enabled = true
+max_inline_bytes = 8192
+
+[checkpoint]
+enabled = true
+interval_generations = 5
+
+[controller]
+max_generations = 20000
+max_retries = 5
+metrics_interval_seconds = 5.0
+stagnation_patience = 5000
+max_inflight = 2

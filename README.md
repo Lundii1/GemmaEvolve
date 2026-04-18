@@ -72,6 +72,7 @@ There are also harder deterministic benchmarks you can try:
 - [experiments/weighted_tardiness.toml](/C:/Users/amine/OneDrive/Desktop/GemmaEvolve/experiments/weighted_tardiness.toml) for single-machine weighted tardiness scheduling with an exact target of `3413`
 - [experiments/budgeted_coverage.toml](/C:/Users/amine/OneDrive/Desktop/GemmaEvolve/experiments/budgeted_coverage.toml) for budgeted maximum coverage with an exact target of `343`
 - [experiments/turan_tetrahedron.toml](/C:/Users/amine/OneDrive/Desktop/GemmaEvolve/experiments/turan_tetrahedron.toml) for dense `K_4^3`-free 3-uniform hypergraph construction with a reference target of `5502`
+- [experiments/turan_tetrahedron_full_file.toml](/C:/Users/amine/OneDrive/Desktop/GemmaEvolve/experiments/turan_tetrahedron_full_file.toml) for the same Turan benchmark in `full_file` mutation mode with a broader Docker runtime envelope and a `LongCat-Flash-Lite` configuration
 
 Run a fresh experiment:
 
@@ -126,6 +127,7 @@ Top-level fields:
 - `evaluation_contract`
 - `primary_metric`
 - `target_score`
+- `mutation_scope`
 
 Sections:
 
@@ -140,8 +142,11 @@ Important notes:
 
 - `model.provider='fake'` is no longer supported.
 - `sandbox.backend='fake'` is no longer supported.
-- The current engine is serial-first, so `controller.max_inflight` must stay `1`.
+- `controller.max_inflight` enables bounded parallel generation/evaluation. Start conservatively and scale up based on model-endpoint and Docker stability.
 - `[archive]` is only treated as a deprecated compatibility alias for `[database]`.
+- `mutation_scope="evolve_block"` is the default and restricts edits to `# EVOLVE-BLOCK-START` / `# EVOLVE-BLOCK-END`.
+- `mutation_scope="full_file"` allows edits anywhere in the seed file. This is used by [experiments/turan_tetrahedron_full_file.toml](/C:/Users/amine/OneDrive/Desktop/GemmaEvolve/experiments/turan_tetrahedron_full_file.toml).
+- `[sandbox]` also supports `program_filename`, optional `build_command`, and `run_command` for experiments that need a non-default execution entrypoint.
 
 ### Evaluator Modules
 
@@ -183,14 +188,19 @@ This is what enables prompt logs, lineage inspection, artifact reuse, and resume
 
 ## Evolving Code Safely
 
-This project supports editable regions marked with:
+This project supports two mutation modes:
+
+- `evolve_block` for block-scoped mutation inside explicit markers
+- `full_file` for whole-file mutation when the experiment sets `mutation_scope="full_file"`
+
+In `evolve_block` mode, editable regions are marked with:
 
 ```python
 # EVOLVE-BLOCK-START
 # EVOLVE-BLOCK-END
 ```
 
-Only code inside the block is intended to be mutated. The included knapsack seed demonstrates this in [experiments/knapsack_seed.py](/C:/Users/amine/OneDrive/Desktop/GemmaEvolve/experiments/knapsack_seed.py).
+Only code inside the block is intended to be mutated. The included knapsack seed demonstrates this in [experiments/knapsack_seed.py](/C:/Users/amine/OneDrive/Desktop/GemmaEvolve/experiments/knapsack_seed.py). For whole-file mutation, see [experiments/turan_tetrahedron_full_file.toml](/C:/Users/amine/OneDrive/Desktop/GemmaEvolve/experiments/turan_tetrahedron_full_file.toml).
 
 LLM responses must be emitted as SEARCH/REPLACE blocks:
 

@@ -14,7 +14,7 @@ from alphaevolve.errors import ConfigError
 from alphaevolve.config import load_experiment_config
 from alphaevolve.controller import EvolutionController
 from alphaevolve.evaluators import build_evaluator, docker_environment_status
-from alphaevolve.llm import build_inference_client, check_ollama_availability
+from alphaevolve.llm import build_inference_client, check_inference_availability
 from alphaevolve.logging_utils import configure_logging
 from alphaevolve.models import Program
 from alphaevolve.prompts import PromptBuilder
@@ -35,7 +35,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory that stores fresh run outputs.",
     )
 
-    ollama_parser = subparsers.add_parser("smoke-ollama", help="Smoke-test the Ollama endpoint.")
+    model_parser = subparsers.add_parser(
+        "smoke-model",
+        help="Smoke-test the configured model endpoint.",
+    )
+    model_parser.add_argument("--config", required=True, help="Path to an experiment TOML file.")
+
+    ollama_parser = subparsers.add_parser(
+        "smoke-ollama",
+        help="Backward-compatible alias for smoke-model.",
+    )
     ollama_parser.add_argument("--config", required=True, help="Path to an experiment TOML file.")
 
     docker_parser = subparsers.add_parser("smoke-docker", help="Smoke-test the Docker/gVisor runtime.")
@@ -63,8 +72,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         return asyncio.run(_run_command(args.config, args.resume, output_dir=Path(args.output_dir)))
-    if args.command == "smoke-ollama":
-        return asyncio.run(_smoke_ollama(Path(args.config)))
+    if args.command in {"smoke-model", "smoke-ollama"}:
+        return asyncio.run(_smoke_model(Path(args.config)))
     if args.command == "smoke-docker":
         return asyncio.run(_smoke_docker(Path(args.config)))
     if args.command == "clone-best":
@@ -104,17 +113,25 @@ async def _run_command(config_arg: str | None, resume_arg: str | None, *, output
     return 0 if result.best_program.primary_score >= config.target_score else 1
 
 
-async def _smoke_ollama(config_path: Path) -> int:
+async def _smoke_model(config_path: Path) -> int:
     config = load_experiment_config(config_path)
-    available, reason = await check_ollama_availability(
-        config.model.base_url,
+    available, reason = await check_inference_availability(
+        config.model,
         timeout_seconds=min(config.model.request_timeout_seconds, 2.0),
     )
     logger = logging.getLogger("alphaevolve.cli")
     if not available:
-        logger.info("Skipping Ollama smoke test: %s", reason)
+        logger.info(
+            "Skipping model smoke test for provider=%s: %s",
+            config.model.provider,
+            reason,
+        )
         return 0
-    logger.info("Ollama is reachable at %s", config.model.base_url)
+    logger.info(
+        "Model provider %s is reachable at %s",
+        config.model.provider,
+        config.model.base_url,
+    )
     return 0
 
 
@@ -133,7 +150,10 @@ async def _run_controller(config, *, run_dir: Path, logger: logging.Logger):
     database = ProgramDatabase(config.database, run_dir / "database")
     inference_client = build_inference_client(config.model)
     evaluator = build_evaluator(config.evaluator, config.sandbox, feedback_client=inference_client)
-    prompt_builder = PromptBuilder(config.model.prompt_budget)
+    prompt_builder = PromptBuilder(
+        config.model.prompt_budget,
+        mutation_scope=config.mutation_scope,
+    )
     seed_code = config.seed_program_path.read_text(encoding="utf-8")
     controller = EvolutionController(
         config=config,
@@ -163,7 +183,7 @@ def _clone_best_command(*, config_path: Path, run_dir: Path, output_dir: Path) -
         return 2
 
     database = ProgramDatabase(config.database, database_dir)
-    best_program = database.best_program()
+    best_program = asyncio.run(database.best_program())
     if best_program is None:
         logger.error("Run directory does not contain a best program: %s", resolved_run_dir)
         return 2

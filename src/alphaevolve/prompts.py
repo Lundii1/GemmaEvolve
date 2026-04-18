@@ -72,9 +72,14 @@ class PromptBuilder:
         self,
         budget: PromptBudget,
         token_estimator: TokenEstimator | None = None,
+        *,
+        mutation_scope: str = "evolve_block",
     ) -> None:
         self._budget = budget
         self._token_estimator = token_estimator or CharacterTokenEstimator()
+        if mutation_scope not in {"evolve_block", "full_file"}:
+            raise ValueError(f"Unsupported mutation scope: {mutation_scope}")
+        self._mutation_scope = mutation_scope
 
     def build(
         self,
@@ -86,7 +91,11 @@ class PromptBuilder:
         artifact_context: Sequence[PromptArtifactContext] = (),
         evaluator_feedback: str | None = None,
     ) -> RenderedPrompt:
-        edit_window = locate_edit_window(current_program.code)
+        edit_window = (
+            locate_edit_window(current_program.code)
+            if self._mutation_scope == "evolve_block"
+            else None
+        )
         system_section = self._render_system_section(
             system_instructions,
             has_edit_window=edit_window is not None,
@@ -158,10 +167,22 @@ class PromptBuilder:
         rules = [
             "Respond with SEARCH/REPLACE diff blocks only.",
             "Do not include prose, explanations, bullet lists, or markdown fences.",
+            "Your response must start with <<<<<<< SEARCH and end with >>>>>>> REPLACE.",
+            "If you emit multiple edits, output consecutive SEARCH/REPLACE blocks with no separator text.",
+            "Never include any text before the first SEARCH marker or after the final REPLACE marker.",
             "History programs are reference-only; use them for ideas, not for SEARCH text.",
             "Copy every SEARCH block exactly from the Current Program section.",
+            "Prefer one semantically complete edit unit.",
+            "The SEARCH block must include a semantically complete logical chain needed to make the change valid.",
+            "Never patch a single conditional branch, a single line in a repeated chain, or a partial loop body.",
+            "It is valid to replace a full helper function, loop, or repeated conditional chain when the change spans that unit.",
+            "If a smaller chain would make the edit incomplete, replace the entire helper function.",
+            "Emit one SEARCH/REPLACE block per logical edit unit; only emit multiple blocks for disjoint units.",
         ]
-        if has_edit_window:
+        if self._mutation_scope == "full_file":
+            rules.append("You may modify any part of the current program file.")
+            rules.append("It is valid to replace imports, helper functions, and the overall algorithm structure when needed.")
+        elif has_edit_window:
             rules.append(
                 f"Only modify code between {EVOLVE_BLOCK_START_MARKER} and {EVOLVE_BLOCK_END_MARKER}."
             )
@@ -269,19 +290,11 @@ class PromptBuilder:
         return " | ".join(summaries[:2])
 
     def _rank_history(self, current_program: Program, history: Sequence[Program]) -> list[Program]:
-        current_cell = current_program.archive_cell
-
-        def diversity(program: Program) -> int:
-            if current_cell is None or program.archive_cell is None:
-                return abs(len(program.code) - len(current_program.code))
-            return sum(
-                abs(program_dim - current_dim)
-                for program_dim, current_dim in zip(program.archive_cell, current_cell)
-            )
-
-        deduped = {program.id: program for program in history if program.id != current_program.id}
-        return sorted(
-            deduped.values(),
-            key=lambda program: (program.primary_score, diversity(program)),
-            reverse=True,
-        )
+        ordered: list[Program] = []
+        seen: set[str] = set()
+        for program in history:
+            if program.id == current_program.id or program.id in seen:
+                continue
+            ordered.append(program)
+            seen.add(program.id)
+        return ordered

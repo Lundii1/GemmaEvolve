@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from alphaevolve.archive import ProgramDatabase
@@ -54,7 +55,7 @@ max_inflight = 1
     seed_program = Program.seed(seed_path.read_text(encoding="utf-8"))
     seed_program.primary_score = 1.0
     seed_program.metrics = {"score": 1.0}
-    database.record_seed_across_islands(seed_program)
+    asyncio.run(database.record_seed_across_islands(seed_program))
 
     best_program = Program(
         id="prog_best1234",
@@ -65,7 +66,7 @@ max_inflight = 1
     )
     best_program.primary_score = 2.0
     best_program.metrics = {"score": 2.0}
-    database.record(best_program)
+    asyncio.run(database.record(best_program))
 
     clone_dir = tmp_path / "demo-clone"
 
@@ -133,7 +134,7 @@ max_inflight = 1
     seed_program = Program.seed(seed_path.read_text(encoding="utf-8"))
     seed_program.primary_score = 1.0
     seed_program.metrics = {"score": 1.0}
-    database.record_seed_across_islands(seed_program)
+    asyncio.run(database.record_seed_across_islands(seed_program))
 
     best_program = Program(
         id="prog_best5678",
@@ -144,7 +145,7 @@ max_inflight = 1
     )
     best_program.primary_score = 3.0
     best_program.metrics = {"score": 3.0}
-    database.record(best_program)
+    asyncio.run(database.record(best_program))
 
     clone_dir = tmp_path / "demo-clone"
     clone_dir.mkdir()

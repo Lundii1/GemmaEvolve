@@ -74,3 +74,35 @@ def test_prose_wrapped_diff_is_rejected() -> None:
     return 2
 >>>>>>> REPLACE"""
         )
+
+
+def test_malformed_marker_lines_are_normalized() -> None:
+    source = "def score():\n    return 1\n"
+    diff = parse_diff(
+        """<<<<<<<<< SEARCH
+    return 1
+=========
+    return 2
+>>>>>>>>>> REPLACE"""
+    )
+
+    updated = apply_diff(source, diff)
+
+    assert "return 2" in updated
+
+
+def test_outer_markdown_fence_is_ignored_for_diff_only_payloads() -> None:
+    source = "def score():\n    return 1\n"
+    diff = parse_diff(
+        """```python
+<<<<<<< SEARCH
+    return 1
+=======
+    return 4
+>>>>>>> REPLACE
+```"""
+    )
+
+    updated = apply_diff(source, diff)
+
+    assert "return 4" in updated

@@ -25,6 +25,16 @@ class _StubInferenceClient(AsyncInferenceClient):
         return self._response
 
 
+class _CapturingInferenceClient(AsyncInferenceClient):
+    def __init__(self, response: str) -> None:
+        self._response = response
+        self.prompts: list[str] = []
+
+    async def generate_text(self, prompt: str, *, attempt: int = 1) -> str:
+        self.prompts.append(prompt)
+        return self._response
+
+
 class _FakeDockerClient:
     def __init__(self, *, info_payload=None, ping_error: Exception | None = None) -> None:
         self._info_payload = info_payload or {}
@@ -171,6 +181,100 @@ def evaluate(context):
     )
 
     assert result.feedback == "Focus on the failing path."
+
+
+def test_module_evaluator_feedback_prompt_includes_features_for_borderline_success(tmp_path) -> None:
+    evaluator_module = _write_module(
+        tmp_path / "borderline_eval.py",
+        """
+def evaluate(context):
+    return {
+        "status": "success",
+        "metrics": {"score": 9.0, "seed_score": 6.0, "delta_score": 3.0},
+        "features": {"delta_score": 3.0, "signature_210_ratio": 0.45},
+        "primary_score": 9.0,
+        "execution": {"status": "success", "stderr": ""},
+    }
+""",
+    )
+    feedback_client = _CapturingInferenceClient("Focus on the mixed-family delta.")
+    evaluator = build_evaluator(
+        EvaluatorConfig(
+            module=evaluator_module,
+            stages=EvaluatorStageConfig(enabled=False),
+            feedback=EvaluatorFeedbackConfig(
+                enabled=True,
+                on_success=False,
+                borderline_score_threshold=10.0,
+                max_feedback_chars=120,
+            ),
+            artifacts=EvaluatorArtifactsConfig(enabled=True),
+        ),
+        SandboxConfig(backend="python", timeout_seconds=5.0),
+        feedback_client=feedback_client,
+    )
+
+    result = asyncio.run(
+        evaluator.evaluate(
+            Program(id="prog4", code="print('x')\n"),
+            primary_metric="score",
+            artifact_dir=tmp_path / "artifacts",
+        )
+    )
+
+    assert result.feedback == "Focus on the mixed-family delta."
+    assert feedback_client.prompts
+    assert "Features:" in feedback_client.prompts[0]
+    assert "signature_210_ratio" in feedback_client.prompts[0]
+    assert "delta_score" in feedback_client.prompts[0]
+
+
+def test_module_evaluator_supports_build_then_run_commands(tmp_path) -> None:
+    evaluator_module = _write_module(
+        tmp_path / "build_eval.py",
+        """
+async def evaluate_stage1(context):
+    metrics, execution = await context.execute_candidate()
+    return {
+        "status": execution.status,
+        "metrics": metrics,
+        "features": {},
+        "primary_score": metrics.get(context.primary_metric, 0.0),
+        "should_continue": execution.status == "success",
+        "execution": execution.to_dict(),
+    }
+""",
+    )
+    evaluator = build_evaluator(
+        EvaluatorConfig(module=evaluator_module),
+        SandboxConfig(
+            backend="python",
+            timeout_seconds=5.0,
+            program_filename="candidate.src",
+            build_command=(
+                "python",
+                "-c",
+                "from pathlib import Path; import sys; Path('built.py').write_text(Path(sys.argv[1]).read_text(), encoding='utf-8')",
+                "{program}",
+            ),
+            run_command=("python", "built.py"),
+        ),
+    )
+    program = Program(
+        id="prog_build",
+        code="import json\nprint(json.dumps({'score': 7.0}))\n",
+    )
+
+    result = asyncio.run(
+        evaluator.evaluate(
+            program,
+            primary_metric="score",
+            artifact_dir=tmp_path / "artifacts",
+        )
+    )
+
+    assert result.status == "success"
+    assert result.primary_score == 7.0
 
 
 def test_docker_environment_status_reports_daemon_unavailable(monkeypatch) -> None:

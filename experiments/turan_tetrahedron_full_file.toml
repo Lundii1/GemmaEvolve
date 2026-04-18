@@ -1,60 +1,61 @@
-name = "turan_tetrahedron"
-description = "Search for dense K_4^3-free 3-uniform hypergraphs by evolving a bounded improver heuristic around a fixed mixed-family seed."
+name = "turan_tetrahedron_full_file"
+description = "Search for dense K_4^3-free 3-uniform hypergraphs by evolving the full seeded program file with a broader offline runtime envelope."
 seed_program = "turan_tetrahedron_seed.py"
 primary_metric = "score"
 target_score = 5502.0
+mutation_scope = "full_file"
 system_instructions = """
 Act as an expert Python extremal-combinatorics engineer.
-Improve the provided program by proposing small, coherent code changes.
+Improve the provided program by proposing coherent, high-leverage code changes.
 Return raw SEARCH/REPLACE diff blocks only.
 Your response must begin with <<<<<<< SEARCH and end with >>>>>>> REPLACE.
 Do not include any prose, explanations, markdown fences, comments outside the patch, or text before, between, or after diff blocks.
 """
 task_description = """
 The benchmark constructs deterministic 3-uniform hypergraphs on several vertex counts.
-Only the bounded improve_construction heuristic inside the EVOLVE block should change.
 The current seeded program already scores 5443 on the benchmark cases in this experiment.
 The evaluator also reports gains relative to the original mixed-family 5286 baseline for reference.
 A 5502-class reference construction is known on these finite cases, so treat that score as achievable rather than speculative.
 Your job is to improve the seeded construction within the provided deterministic max_steps budget while preserving exact K_4^3-freeness.
-You may modify local_priority(), the blocked-edge ordering, the swap loop, the final greedy pass, or the full improve_construction() body.
-For example, it is valid to rewrite the blocked-edge traversal or the one-for-one swap logic instead of only retuning local_priority().
+You may rewrite any helper, import, or algorithmic phase in the file, as long as the program still exposes evaluate() and produces the expected metric dictionary.
+It is valid to add new helper functions, new data structures, caching, multi-phase search procedures, or to replace improve_construction() entirely with a different bounded optimizer.
 Refine the mixed-family basin represented by initial_edges; do not collapse back to pure (1,1,1) behavior.
-Prefer one local, coherent edit at a time.
+Prefer one coherent algorithmic change at a time.
 """
 evaluation_contract = """
-The program exposes evaluate() and should maximize the returned score.
+The program must expose evaluate() and should maximize the returned score.
 Scores are the total number of accepted 3-edges across the benchmark cases.
-The EVOLVE block receives num_vertices, part_of, initial_edges, and max_steps, and must return a full candidate edge set.
-K_4^3-freeness, output validation, seeded initialization, and score accounting are enforced exactly outside the EVOLVE block.
+The seeded initialization, K_4^3-freeness checks, output validation, and score accounting must remain correct for the evaluator to succeed.
+You may change any internal implementation detail in the file, but evaluate() must keep returning a JSON-serializable metrics dictionary.
 The configured stop target is the score of a strong reference construction, not a proven global optimum.
 """
 
 [model]
 provider = "longcat"
-model = "LongCat-Flash-Chat"
-#model = "LongCat-Flash-Chat"
+model = "LongCat-Flash-Lite"
 base_url = "https://api.longcat.chat/openai"
 api_key_env = "LONGCAT_API_KEY"
 request_timeout_seconds = 180.0
-temperature = 0.6
-max_prompt_tokens = 16000
-reserved_completion_tokens = 3072
+temperature = 0.4
+max_prompt_tokens = 20000
+reserved_completion_tokens = 4096
 max_history_programs = 6
 max_artifact_context = 4
 
 [sandbox]
 backend = "docker"
-image = "python:3.12-slim"
+image = "python:3.12-bookworm"
 runtime = "runc"
 network_mode = "none"
 read_only_root = true
 tmpfs_path = "/tmp/eval"
-tmpfs_size_bytes = 5242880
-mem_limit = "256m"
-cpu_quota = 50000
-timeout_seconds = 30.0
+tmpfs_size_bytes = 33554432
+mem_limit = "1g"
+cpu_quota = 100000
+timeout_seconds = 120.0
 working_dir = "/workspace"
+program_filename = "program.py"
+run_command = ["python", "{program}"]
 
 [database]
 islands = 3
@@ -129,4 +130,4 @@ max_generations = 20000
 max_retries = 5
 metrics_interval_seconds = 5.0
 stagnation_patience = 5000
-max_inflight = 4
+max_inflight = 2

@@ -6,6 +6,7 @@ import asyncio
 import importlib.util
 import inspect
 import json
+import shlex
 import shutil
 import sys
 import tempfile
@@ -32,6 +33,11 @@ from alphaevolve.models import (
 class SandboxExecutor(ABC):
     """Executes a candidate program inside a configured runtime."""
 
+    @property
+    @abstractmethod
+    def program_filename(self) -> str:
+        """Filename used for the candidate program inside the workspace."""
+
     @abstractmethod
     async def execute(
         self,
@@ -52,6 +58,10 @@ class PythonSubprocessSandbox(SandboxExecutor):
     def __init__(self, config: SandboxConfig) -> None:
         self._config = config
 
+    @property
+    def program_filename(self) -> str:
+        return self._config.program_filename
+
     async def execute(
         self,
         program_path: Path,
@@ -60,9 +70,53 @@ class PythonSubprocessSandbox(SandboxExecutor):
         primary_metric: str,
     ) -> tuple[dict[str, float], ExecutionResult]:
         started = asyncio.get_running_loop().time()
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        if self._config.build_command is not None:
+            build_stdout, build_stderr, build_code, build_status = await self._run_command(
+                _resolve_local_command(self._config.build_command, program_path.name),
+                work_dir=work_dir,
+            )
+            stdout_chunks.append(build_stdout)
+            stderr_chunks.append(build_stderr)
+            if build_status != "success":
+                return (
+                    {primary_metric: 0.0},
+                    ExecutionResult(
+                        stdout="".join(stdout_chunks),
+                        stderr="".join(stderr_chunks),
+                        exit_code=build_code,
+                        duration_ms=(asyncio.get_running_loop().time() - started) * 1_000,
+                        status=build_status,
+                    ),
+                )
+
+        run_stdout, run_stderr, run_code, run_status = await self._run_command(
+            _resolve_local_command(self._config.run_command, program_path.name),
+            work_dir=work_dir,
+        )
+        stdout_chunks.append(run_stdout)
+        stderr_chunks.append(run_stderr)
+        execution = ExecutionResult(
+            stdout="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
+            exit_code=run_code,
+            duration_ms=(asyncio.get_running_loop().time() - started) * 1_000,
+            status=run_status,
+        )
+        if run_status != "success":
+            return {primary_metric: 0.0}, execution
+        return _metrics_from_stdout(run_stdout, primary_metric), execution
+
+    async def _run_command(
+        self,
+        command: tuple[str, ...],
+        *,
+        work_dir: Path,
+    ) -> tuple[str, str, int | None, str]:
         process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            str(program_path.name),
+            *command,
             cwd=str(work_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -72,29 +126,13 @@ class PythonSubprocessSandbox(SandboxExecutor):
                 process.communicate(),
                 timeout=self._config.timeout_seconds,
             )
-            stdout = stdout_bytes.decode("utf-8", errors="replace")
-            stderr = stderr_bytes.decode("utf-8", errors="replace")
-            execution = ExecutionResult(
-                stdout=stdout,
-                stderr=stderr,
-                exit_code=process.returncode,
-                duration_ms=(asyncio.get_running_loop().time() - started) * 1_000,
-                status="success" if process.returncode == 0 else "error",
-            )
-            if process.returncode != 0:
-                return {primary_metric: 0.0}, execution
-            return _metrics_from_stdout(stdout, primary_metric), execution
         except TimeoutError:
             process.kill()
             await process.communicate()
-            return (
-                {primary_metric: 0.0},
-                ExecutionResult(
-                    exit_code=None,
-                    duration_ms=(asyncio.get_running_loop().time() - started) * 1_000,
-                    status="timeout",
-                ),
-            )
+            return "", "", None, "timeout"
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        return stdout, stderr, process.returncode, "success" if process.returncode == 0 else "error"
 
 
 class DockerGVisorSandbox(SandboxExecutor):
@@ -103,6 +141,10 @@ class DockerGVisorSandbox(SandboxExecutor):
     def __init__(self, config: SandboxConfig) -> None:
         self._config = config
         self._docker_client = None
+
+    @property
+    def program_filename(self) -> str:
+        return self._config.program_filename
 
     async def execute(
         self,
@@ -129,9 +171,10 @@ class DockerGVisorSandbox(SandboxExecutor):
         started = perf_counter()
         container = None
         try:
+            command = self._container_command(program_path, work_dir)
             container = client.containers.run(
                 self._config.image,
-                command=["python", f"{self._config.working_dir}/{program_path.name}"],
+                command=command,
                 detach=True,
                 network_mode=self._config.network_mode,
                 read_only=self._config.read_only_root,
@@ -210,6 +253,21 @@ class DockerGVisorSandbox(SandboxExecutor):
         if self._docker_client is not None:
             await asyncio.to_thread(self._docker_client.close)
 
+    def _container_command(self, program_path: Path, work_dir: Path) -> list[str]:
+        if self._config.build_command is None and self._config.run_command == ("python", "{program}"):
+            return ["python", program_path.name]
+
+        script_path = work_dir / ".alphaevolve_run.sh"
+        script_path.write_text(
+            _docker_script(
+                build_command=self._config.build_command,
+                run_command=self._config.run_command,
+                program_name=program_path.name,
+            ),
+            encoding="utf-8",
+        )
+        return ["/bin/sh", f"{self._config.working_dir}/{script_path.name}"]
+
 
 class EvaluationContext:
     """Runtime context passed to evaluator modules."""
@@ -280,7 +338,7 @@ class ModuleEvaluator(Evaluator):
         artifact_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=f"{program.id}_") as temp_dir:
             work_dir = Path(temp_dir)
-            program_path = work_dir / "program.py"
+            program_path = work_dir / self._sandbox.program_filename
             program_path.write_text(program.code, encoding="utf-8")
             context = EvaluationContext(
                 program=program,
@@ -634,6 +692,7 @@ class ModuleEvaluator(Evaluator):
             f"Status: {result.status}\n"
             f"Primary score: {result.primary_score}\n"
             f"Metrics: {json.dumps(result.metrics, sort_keys=True)}\n"
+            f"Features: {json.dumps(result.features, sort_keys=True)}\n"
             f"Rejection reason: {result.rejection_reason or 'none'}\n"
             f"Stderr excerpt: {stderr_excerpt or '<empty>'}\n"
         )
@@ -686,6 +745,30 @@ def _truncate(value: str, *, limit: int = 600) -> str:
     if len(value) <= limit:
         return value
     return f"{value[:limit]}..."
+
+
+def _resolve_command(command: tuple[str, ...], program_name: str) -> tuple[str, ...]:
+    return tuple(part.replace("{program}", program_name) for part in command)
+
+
+def _resolve_local_command(command: tuple[str, ...], program_name: str) -> tuple[str, ...]:
+    resolved = list(_resolve_command(command, program_name))
+    if resolved and resolved[0] == "python":
+        resolved[0] = sys.executable
+    return tuple(resolved)
+
+
+def _docker_script(
+    *,
+    build_command: tuple[str, ...] | None,
+    run_command: tuple[str, ...],
+    program_name: str,
+) -> str:
+    commands: list[str] = ["set -eu"]
+    if build_command is not None:
+        commands.append(shlex.join(_resolve_command(build_command, program_name)))
+    commands.append(shlex.join(_resolve_command(run_command, program_name)))
+    return "\n".join(commands) + "\n"
 
 
 def docker_environment_status(runtime_name: str = "runsc") -> tuple[bool, str]:

@@ -13,6 +13,11 @@ _DIFF_PATTERN = re.compile(
     r"<<<<<<< SEARCH\r?\n(.*?)\r?\n=======\r?\n(.*?)\r?\n>>>>>>> REPLACE",
     re.DOTALL,
 )
+_OUTER_FENCE_PATTERN = re.compile(r"^```[^\n`]*\r?\n(?P<body>.*)\r?\n```$", re.DOTALL)
+_SEARCH_MARKER_PATTERN = re.compile(r"^<+\s*SEARCH\s*$")
+_DIVIDER_MARKER_PATTERN = re.compile(r"^={3,}\s*$")
+_REPLACE_MARKER_PATTERN = re.compile(r"^>+\s*REPLACE\s*$")
+_ZERO_WIDTH_TRANSLATION = str.maketrans("", "", "\u200b\u200c\u200d\u2060\ufeff")
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,21 +30,22 @@ class _Match:
 
 def parse_diff(raw_text: str) -> Diff:
     """Extract SEARCH/REPLACE blocks from a raw model response."""
-    matches = list(_DIFF_PATTERN.finditer(raw_text))
+    normalized_text = _normalize_diff_text(raw_text)
+    matches = list(_DIFF_PATTERN.finditer(normalized_text))
     if not matches:
         raise DiffParseError("No SEARCH/REPLACE blocks were found in the model response.")
     cursor = 0
     for match in matches:
-        if raw_text[cursor : match.start()].strip():
+        if normalized_text[cursor : match.start()].strip():
             raise DiffParseError("Model response contained text outside SEARCH/REPLACE blocks.")
         cursor = match.end()
-    if raw_text[cursor:].strip():
+    if normalized_text[cursor:].strip():
         raise DiffParseError("Model response contained text outside SEARCH/REPLACE blocks.")
     blocks = tuple(
         DiffBlock(search=match.group(1), replace=match.group(2))
         for match in matches
     )
-    return Diff(raw_text=raw_text, blocks=blocks)
+    return Diff(raw_text=normalized_text, blocks=blocks)
 
 
 def apply_diff(source: str, diff: Diff) -> str:
@@ -155,6 +161,49 @@ def _normalize_line_endings_with_map(text: str) -> tuple[str, list[int]]:
         index += 1
     index_map.append(len(text))
     return "".join(normalized_chars), index_map
+
+
+def _normalize_diff_text(raw_text: str) -> str:
+    text = raw_text.strip()
+    fenced_body = _strip_outer_markdown_fence(text)
+    if fenced_body is not None:
+        text = fenced_body
+    lines = text.splitlines()
+    normalized_lines = [_normalize_marker_line(line) for line in lines]
+    return "\n".join(normalized_lines)
+
+
+def _strip_outer_markdown_fence(text: str) -> str | None:
+    match = _OUTER_FENCE_PATTERN.match(text)
+    if match is None:
+        return None
+    body = match.group("body").strip()
+    if _contains_diff_markers(body):
+        return body
+    return None
+
+
+def _contains_diff_markers(text: str) -> bool:
+    saw_search = False
+    saw_replace = False
+    for line in text.splitlines():
+        normalized = _normalize_marker_line(line)
+        if normalized == "<<<<<<< SEARCH":
+            saw_search = True
+        elif normalized == ">>>>>>> REPLACE":
+            saw_replace = True
+    return saw_search and saw_replace
+
+
+def _normalize_marker_line(line: str) -> str:
+    candidate = line.translate(_ZERO_WIDTH_TRANSLATION).strip()
+    if _SEARCH_MARKER_PATTERN.fullmatch(candidate):
+        return "<<<<<<< SEARCH"
+    if _DIVIDER_MARKER_PATTERN.fullmatch(candidate):
+        return "======="
+    if _REPLACE_MARKER_PATTERN.fullmatch(candidate):
+        return ">>>>>>> REPLACE"
+    return line
 
 
 def _split_lines_with_spans(text: str) -> Iterable[tuple[str, int, int]]:

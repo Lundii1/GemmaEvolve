@@ -113,6 +113,7 @@ class ModelConfig:
     provider: str = "ollama"
     model: str = "gemma4:26b"
     base_url: str = "http://localhost:11434"
+    api_key_env: str | None = None
     request_timeout_seconds: float = 120.0
     temperature: float = 0.2
     prompt_budget: PromptBudget = field(default_factory=PromptBudget)
@@ -133,6 +134,9 @@ class SandboxConfig:
     cpu_quota: int = 50_000
     timeout_seconds: float = 10.0
     working_dir: str = "/workspace"
+    program_filename: str = "program.py"
+    build_command: tuple[str, ...] | None = None
+    run_command: tuple[str, ...] = ("python", "{program}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +178,12 @@ class RetentionConfig:
     sample_elite_weight: float = 0.55
     sample_recent_weight: float = 0.25
     sample_hall_of_fame_weight: float = 0.20
+    parent_share_window: int = 64
+    parent_share_cap: float = 0.35
+    best_parent_cooldown_samples: int = 8
+    mutation_failure_streak_threshold: int = 3
+    mutation_failure_penalty_samples: int = 12
+    mutation_failure_weight_multiplier: float = 0.20
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +281,7 @@ class ExperimentConfig:
     evaluation_contract: str
     primary_metric: str
     target_score: float
+    mutation_scope: Literal["evolve_block", "full_file"] = "evolve_block"
     model: ModelConfig = field(default_factory=ModelConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
@@ -519,6 +530,8 @@ class Program:
     archive_cell: tuple[int, ...] | None = None
     prompt_log_id: str | None = None
     artifact_records: tuple[ArtifactRecord, ...] = ()
+    behavior_fingerprint: str | None = None
+    behaviorally_novel: bool = False
     lineage_depth: int = 0
     accepted: bool = True
     rejection_reason: str | None = None
@@ -545,6 +558,8 @@ class Program:
             "archive_cell": list(self.archive_cell) if self.archive_cell is not None else None,
             "prompt_log_id": self.prompt_log_id,
             "artifact_records": [record.to_dict() for record in self.artifact_records],
+            "behavior_fingerprint": self.behavior_fingerprint,
+            "behaviorally_novel": self.behaviorally_novel,
             "lineage_depth": self.lineage_depth,
             "accepted": self.accepted,
             "rejection_reason": self.rejection_reason,
@@ -571,6 +586,12 @@ class Program:
             artifact_records=tuple(
                 ArtifactRecord.from_dict(item) for item in data.get("artifact_records", [])
             ),
+            behavior_fingerprint=(
+                str(data["behavior_fingerprint"])
+                if data.get("behavior_fingerprint") is not None
+                else None
+            ),
+            behaviorally_novel=bool(data.get("behaviorally_novel", False)),
             lineage_depth=int(data.get("lineage_depth", 0)),
             accepted=bool(data.get("accepted", True)),
             rejection_reason=str(data["rejection_reason"]) if data.get("rejection_reason") is not None else None,
